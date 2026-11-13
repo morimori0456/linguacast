@@ -69,6 +69,7 @@ button:focus-visible,input:focus-visible,a:focus-visible{outline:3px solid #476f
 .word.current{font-weight:inherit}
 .line-loop{width:44px;height:44px;top:50%;transform:translateY(-50%);font-size:20px;color:#455448}
 .small-play{width:44px;height:44px}
+.episode-heading-meta{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-bottom:5px}.episode-heading-meta .episode-date{margin:0}.episode-transcript-status{display:inline-flex;align-items:center;border-radius:20px;padding:4px 7px;background:#e8efdb;color:#526d43;font-family:'DM Mono',monospace;font-size:9px;letter-spacing:.15px;line-height:1.2;white-space:nowrap}.episode-transcript-status.queued,.episode-transcript-status.downloading,.episode-transcript-status.processing{background:#f7eadb;color:#996337}.episode-transcript-status.error{background:#f8e5e1;color:#a14d3f}
 .outline-button{padding:8px 14px}
 .speed-button{min-width:44px;min-height:44px;font-size:14px}
 .speed-option{min-height:44px;font-size:14px}
@@ -100,3 +101,4 @@ button:focus-visible,input:focus-visible,a:focus-visible{outline:3px solid #476f
 @media(max-width:650px){.transcript-line{padding-right:56px}}
 .line-time{min-width:44px;min-height:44px;display:inline-flex;align-items:center;justify-content:flex-start;padding:0 6px 0 0;border:0;background:transparent;color:#526055;font-family:'DM Mono',monospace;font-size:12px;text-align:left;vertical-align:middle;cursor:pointer}
 .follow-playback{min-height:44px;font-size:14px}
+.feed-sync-warning{display:block;margin-top:4px;color:#a14d3f;font-size:10px;font-weight:700;line-height:1.2}

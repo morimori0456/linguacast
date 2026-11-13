@@ -36,12 +36,18 @@ async function api(path, options = {}) {
 function listFrom(data, key) { if (Array.isArray(data)) return data; return data[key] || data.items || data.results || []; }
 function coverMarkup(item, extra = '') { return item.image_url || item.artwork_url || item.image ? `<img class="feed-cover ${extra}" src="${escapeHTML(item.image_url || item.artwork_url || item.image)}" alt="" loading="lazy" />` : `<span class="feed-cover cover-placeholder ${extra}" aria-hidden="true">♫</span>`; }
 
+function episodeTranscriptStatus(episode) {
+  const status = String(episode.transcript_status || '').toLowerCase();
+  const labels = { ready: 'Transcript ready', queued: 'Queued', downloading: 'Downloading', processing: 'Transcribing', error: 'Failed' };
+  return labels[status] ? `<span class="episode-transcript-status ${status}" role="status">${labels[status]}</span>` : '';
+}
+
 async function loadFeeds() {
   const data = await api('/api/feeds');
   state.feeds = listFrom(data, 'feeds');
   $('#feed-count').textContent = `${state.feeds.length} ${state.feeds.length === 1 ? 'podcast' : 'podcasts'}`;
   $('#empty-library').hidden = state.feeds.length > 0;
-  $('#feed-list').innerHTML = state.feeds.map((feed) => `<button class="feed-card" data-feed-id="${escapeHTML(idOf(feed))}">${coverMarkup(feed)}<span class="feed-info"><span class="feed-title">${escapeHTML(titleOf(feed))}</span><span class="feed-subtitle">${escapeHTML(feed.author || feed.subtitle || 'Podcast')}</span></span><span class="feed-arrow" aria-hidden="true">↗</span></button>`).join('');
+  $('#feed-list').innerHTML = state.feeds.map((feed) => `<button class="feed-card" data-feed-id="${escapeHTML(idOf(feed))}">${coverMarkup(feed)}<span class="feed-info"><span class="feed-title">${escapeHTML(titleOf(feed))}</span><span class="feed-subtitle">${escapeHTML(feed.author || feed.subtitle || 'Podcast')}</span>${feed.last_poll_error ? '<span class="feed-sync-warning">RSS update failed</span>' : ''}</span><span class="feed-arrow" aria-hidden="true">↗</span></button>`).join('');
 }
 
 async function openFeed(feedId) {
@@ -54,13 +60,14 @@ async function openFeed(feedId) {
   try {
     try { await api(`/api/feeds/${encodeURIComponent(feedId)}/refresh`, { method: 'POST', body: '{}' }); }
     catch (error) { showToast(`Could not refresh episodes. Showing saved episodes: ${error.message}`); }
+    await loadFeeds().catch(() => {});
     const data = await api(`/api/feeds/${encodeURIComponent(feedId)}/episodes`);
     state.episodes = listFrom(data, 'episodes');
     if (!state.episodes.length) { $('#episode-list').innerHTML = '<div class="transcript-notice">No episodes found.</div>'; return; }
     $('#episode-list').innerHTML = state.episodes.map((episode) => {
       const description = (episode.description || episode.summary || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
       const date = episode.published_at || episode.pub_date || episode.published || '';
-      return `<article class="episode-card"><div><div class="episode-date">${escapeHTML(date ? String(date).slice(0, 10) : 'EPISODE')}</div><h3>${escapeHTML(titleOf(episode))}</h3><p>${escapeHTML(description)}</p></div><div class="episode-actions"><button class="small-play" data-episode-id="${escapeHTML(idOf(episode))}" aria-label="${escapeHTML(titleOf(episode))}  — open">▶</button></div></article>`;
+      return `<article class="episode-card"><div><div class="episode-heading-meta"><div class="episode-date">${escapeHTML(date ? String(date).slice(0, 10) : 'EPISODE')}</div>${episodeTranscriptStatus(episode)}</div><h3>${escapeHTML(titleOf(episode))}</h3><p>${escapeHTML(description)}</p></div><div class="episode-actions"><button class="small-play" data-episode-id="${escapeHTML(idOf(episode))}" aria-label="${escapeHTML(titleOf(episode))}  — open">▶</button></div></article>`;
     }).join('');
     $('#episode-section').scrollIntoView({ behavior: 'smooth', block: 'start' });
   } catch (error) { $('#episode-list').innerHTML = `<div class="transcript-notice">${escapeHTML(error.message)}</div>`; }
@@ -123,7 +130,7 @@ async function openEpisode(episodeId) {
     if (requestId !== state.episodeRequestId) return;
     const transcript = transcriptData(result);
     if (transcript.segments.length) { state.segments = transcript.segments; renderTranscript(); setTranscriptStatus('ready'); }
-    else if (['processing', 'queued', 'downloading'].includes(transcript.status)) { state.segments = []; renderTranscript(); setTranscriptStatus('pending'); pollTranscript(episodeId, null, requestId); }
+    else if (['processing', 'queued', 'downloading'].includes(transcript.status)) { state.segments = []; renderTranscript(); setTranscriptStatus('pending'); pollTranscript(episodeId, requestId); }
     else if (transcript.status === 'error') { state.segments = []; renderTranscript(); setTranscriptStatus('error', transcript.error); }
     else { state.segments = []; renderTranscript(); setTranscriptStatus('missing'); }
     window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -168,55 +175,40 @@ async function startTranscription() {
   try {
     const result = await api(`/api/episodes/${encodeURIComponent(episodeId)}/transcribe`, { method: 'POST', body: '{}' });
     if (requestId !== state.episodeRequestId) return;
-    const jobId = result.job_id || result.id;
     if (result.transcript?.segments?.length || result.segments?.length) { state.segments = result.transcript?.segments || result.segments; renderTranscript(); setTranscriptStatus('ready'); }
-    else { pollTranscript(episodeId, jobId, requestId); }
+    else { pollTranscript(episodeId, requestId); }
     showToast('Transcription started');
   } catch (error) {
     if (requestId !== state.episodeRequestId) return;
     if (error.status === 409) {
       const transcript = transcriptData(await api(`/api/episodes/${encodeURIComponent(episodeId)}/transcript`).catch(() => ({})));
       if (requestId !== state.episodeRequestId) return;
-      if (['queued', 'downloading', 'processing'].includes(transcript.status)) { setTranscriptStatus('pending'); pollTranscript(episodeId); showToast('Transcription is already in progress'); }
+      if (['queued', 'downloading', 'processing'].includes(transcript.status)) { setTranscriptStatus('pending'); pollTranscript(episodeId, requestId); showToast('Transcription is already in progress'); }
       else { setTranscriptStatus('error', error.message); showToast(`Could not start transcription: ${error.message}`); }
     } else { setTranscriptStatus('error', error.message); showToast(`Could not start transcription: ${error.message}`); }
   }
   finally { if (requestId === state.episodeRequestId) { button.disabled = false; button.innerHTML = 'Create transcript <span>✳</span>'; } }
 }
 
-function pollTranscript(episodeId, jobId = null, requestId = state.episodeRequestId) {
+function pollTranscript(episodeId, requestId = state.episodeRequestId) {
   clearInterval(state.pollTimer);
-  let attempts = 0;
   let inFlight = false;
+  let statusCheckWarningShown = false;
   const timer = setInterval(async () => {
     if (requestId !== state.episodeRequestId) { clearInterval(timer); return; }
     if (inFlight) return;
     inFlight = true;
-    attempts += 1;
     try {
-      if (jobId) {
-        const job = await api(`/api/jobs/${encodeURIComponent(jobId)}`);
-        if (requestId !== state.episodeRequestId) { clearInterval(timer); return; }
-        const status = job.status || job.state;
-        if (status === 'failed' || status === 'error') { clearInterval(timer); if (state.pollTimer === timer) state.pollTimer = null; setTranscriptStatus('error', job.error || 'Transcription failed.'); return; }
-      }
       const result = await api(`/api/episodes/${encodeURIComponent(episodeId)}/transcript`);
       if (requestId !== state.episodeRequestId) { clearInterval(timer); return; }
+      statusCheckWarningShown = false;
       const transcript = transcriptData(result);
       if (transcript.segments.length) { clearInterval(timer); if (state.pollTimer === timer) state.pollTimer = null; state.segments = transcript.segments; renderTranscript(); setTranscriptStatus('ready'); showToast('Transcript ready'); }
-      else if (transcript.status === 'error') { clearInterval(timer); if (state.pollTimer === timer) state.pollTimer = null; setTranscriptStatus('error', result.error || 'Transcription failed.'); }
-      else if (attempts > 180) { clearInterval(timer); if (state.pollTimer === timer) state.pollTimer = null; setTranscriptStatus('missing'); showToast('This is taking longer than expected. Check again in a little while.'); }
+      else if (transcript.status === 'error' || transcript.status === 'failed') { clearInterval(timer); if (state.pollTimer === timer) state.pollTimer = null; setTranscriptStatus('error', transcript.error || 'Transcription failed.'); }
+      else if (!['queued', 'downloading', 'processing'].includes(transcript.status)) { clearInterval(timer); if (state.pollTimer === timer) state.pollTimer = null; setTranscriptStatus('error', 'Transcription is no longer active. You can try again.'); }
     } catch (error) {
       if (requestId !== state.episodeRequestId) { clearInterval(timer); return; }
-      if (error.status === 404 && jobId) {
-        const result = await api(`/api/episodes/${encodeURIComponent(episodeId)}/transcript`).catch(() => ({}));
-        if (requestId !== state.episodeRequestId) { clearInterval(timer); return; }
-        const transcript = transcriptData(result);
-        if (transcript.segments.length) { clearInterval(timer); if (state.pollTimer === timer) state.pollTimer = null; state.segments = transcript.segments; renderTranscript(); setTranscriptStatus('ready'); return; }
-        if (transcript.status === 'error') { clearInterval(timer); if (state.pollTimer === timer) state.pollTimer = null; setTranscriptStatus('error', result.error || 'Transcription failed.'); return; }
-        if (!['queued', 'downloading', 'processing'].includes(transcript.status)) { clearInterval(timer); if (state.pollTimer === timer) state.pollTimer = null; setTranscriptStatus('error', 'Could not check transcription status. Please try again.'); return; }
-      }
-      if (attempts > 180) { clearInterval(timer); if (state.pollTimer === timer) state.pollTimer = null; setTranscriptStatus('error', error.message || 'Could not check transcription status. Please try again.'); }
+      if (!statusCheckWarningShown) { statusCheckWarningShown = true; showToast(`Could not check transcription status: ${error.message}`); }
     } finally { inFlight = false; }
   }, 4000);
   state.pollTimer = timer;
