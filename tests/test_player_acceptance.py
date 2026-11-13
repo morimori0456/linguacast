@@ -163,7 +163,7 @@ class PlayerAcceptanceTest(unittest.TestCase):
                 page.locator('[data-episode-id="101"]').click()
                 page.locator(".transcript-line").first.wait_for()
                 page.wait_for_function("document.querySelector('#audio').readyState >= 1")
-                self.assertIn("済み", page.locator("#transcript-status").inner_text())
+                self.assertEqual("Transcript ready", page.locator("#transcript-status").inner_text())
 
                 # Pick a non-default rate and confirm it belongs to the player,
                 # then survives changing episodes.
@@ -199,13 +199,13 @@ class PlayerAcceptanceTest(unittest.TestCase):
                 page.locator('[data-feed-id="10"]').click()
                 page.locator('[data-episode-id="102"]').click()
                 page.wait_for_function("document.querySelector('#transcribe-button').hidden === false")
-                self.assertEqual("未作成", page.locator("#transcript-status").inner_text())
+                self.assertEqual("Not created", page.locator("#transcript-status").inner_text())
                 self.assertEqual(page.locator("#speed-button").inner_text(), "1.5×")
                 self.assertFalse(page.locator("#repeat-button").get_attribute("class").find("active") >= 0)
                 page.locator("#transcribe-button").click()
-                page.wait_for_function("document.querySelector('#transcript-status').textContent.includes('文字起こし中')")
+                page.wait_for_function("document.querySelector('#transcript-status').textContent.includes('Transcribing')")
                 self.assertTrue(transcribe_started.wait(timeout=2))
-                self.assertIn("文字起こし中", page.locator("#transcript-notice").inner_text())
+                self.assertIn("Transcribing", page.locator("#transcript-notice").inner_text())
                 self.assertEqual(errors, [], f"Unexpected browser errors: {errors}")
             finally:
                 browser.close()
