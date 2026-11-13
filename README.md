@@ -2,7 +2,7 @@
 
 Turn an English podcast into a listening lesson. LinguaCast creates a transcript on your own computer, with word-level timing, so you can tap a word or sentence to hear it again.
 
-> The interface is currently in Japanese. This 390 × 844 demo was captured in a mobile browser emulator; it uses a fictional show, transcript, and generated audio. [View a still screenshot](docs/mobile-demo.png).
+This 390 × 844 demo was captured in a mobile browser emulator. It uses a fictional show, transcript, and generated audio. [View a still screenshot](docs/mobile-demo.png).
 
 ![LinguaCast on a mobile-sized screen: transcript lines follow playback and the current word is highlighted](docs/mobile-demo.gif)
 
@@ -33,7 +33,7 @@ The default speech model is `small.en`. On its first use, faster-whisper downloa
 
 1. In LinguaCast, tap the **+** button and paste the podcast's RSS feed URL.
 2. Choose a show, then open an episode.
-3. Tap **文字起こしを作る** (Create transcript). The episode audio is downloaded and cached, then transcription begins. Progress is shown on the episode screen.
+3. Choose **Create transcript**. The episode audio is downloaded and cached, then transcription begins. Progress is shown on the episode screen.
 4. When the transcript is ready, press play. Tap any word to jump to that point, or use the repeat control beside a sentence to practice it again.
 
 An Apple Podcasts **share link** points to an episode page and is not the RSS feed URL LinguaCast expects. Look for the podcast's RSS link on its website or in the podcast provider's settings. Some providers give subscribers a private RSS URL; treat it like a password because it may contain an access token.

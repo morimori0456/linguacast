@@ -39,9 +39,9 @@ function coverMarkup(item, extra = '') { return item.image_url || item.artwork_u
 async function loadFeeds() {
   const data = await api('/api/feeds');
   state.feeds = listFrom(data, 'feeds');
-  $('#feed-count').textContent = `${state.feeds.length}番組`;
+  $('#feed-count').textContent = `${state.feeds.length} ${state.feeds.length === 1 ? 'podcast' : 'podcasts'}`;
   $('#empty-library').hidden = state.feeds.length > 0;
-  $('#feed-list').innerHTML = state.feeds.map((feed) => `<button class="feed-card" data-feed-id="${escapeHTML(idOf(feed))}">${coverMarkup(feed)}<span class="feed-info"><span class="feed-title">${escapeHTML(titleOf(feed))}</span><span class="feed-subtitle">${escapeHTML(feed.author || feed.subtitle || 'ポッドキャスト')}</span></span><span class="feed-arrow" aria-hidden="true">↗</span></button>`).join('');
+  $('#feed-list').innerHTML = state.feeds.map((feed) => `<button class="feed-card" data-feed-id="${escapeHTML(idOf(feed))}">${coverMarkup(feed)}<span class="feed-info"><span class="feed-title">${escapeHTML(titleOf(feed))}</span><span class="feed-subtitle">${escapeHTML(feed.author || feed.subtitle || 'Podcast')}</span></span><span class="feed-arrow" aria-hidden="true">↗</span></button>`).join('');
 }
 
 async function openFeed(feedId) {
@@ -50,17 +50,17 @@ async function openFeed(feedId) {
   state.feedId = feedId;
   $('#episode-heading').textContent = titleOf(feed);
   $('#episode-section').hidden = false;
-  $('#episode-list').innerHTML = '<div class="transcript-notice">エピソードを読み込んでいます…</div>';
+  $('#episode-list').innerHTML = '<div class="transcript-notice">Loading episodes…</div>';
   try {
     try { await api(`/api/feeds/${encodeURIComponent(feedId)}/refresh`, { method: 'POST', body: '{}' }); }
-    catch (error) { showToast(`新着を取得できませんでした。保存済みのエピソードを表示します: ${error.message}`); }
+    catch (error) { showToast(`Could not refresh episodes. Showing saved episodes: ${error.message}`); }
     const data = await api(`/api/feeds/${encodeURIComponent(feedId)}/episodes`);
     state.episodes = listFrom(data, 'episodes');
-    if (!state.episodes.length) { $('#episode-list').innerHTML = '<div class="transcript-notice">エピソードが見つかりませんでした。</div>'; return; }
+    if (!state.episodes.length) { $('#episode-list').innerHTML = '<div class="transcript-notice">No episodes found.</div>'; return; }
     $('#episode-list').innerHTML = state.episodes.map((episode) => {
       const description = (episode.description || episode.summary || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
       const date = episode.published_at || episode.pub_date || episode.published || '';
-      return `<article class="episode-card"><div><div class="episode-date">${escapeHTML(date ? String(date).slice(0, 10) : 'EPISODE')}</div><h3>${escapeHTML(titleOf(episode))}</h3><p>${escapeHTML(description)}</p></div><div class="episode-actions"><button class="small-play" data-episode-id="${escapeHTML(idOf(episode))}" aria-label="${escapeHTML(titleOf(episode))} を開く">▶</button></div></article>`;
+      return `<article class="episode-card"><div><div class="episode-date">${escapeHTML(date ? String(date).slice(0, 10) : 'EPISODE')}</div><h3>${escapeHTML(titleOf(episode))}</h3><p>${escapeHTML(description)}</p></div><div class="episode-actions"><button class="small-play" data-episode-id="${escapeHTML(idOf(episode))}" aria-label="${escapeHTML(titleOf(episode))}  — open">▶</button></div></article>`;
     }).join('');
     $('#episode-section').scrollIntoView({ behavior: 'smooth', block: 'start' });
   } catch (error) { $('#episode-list').innerHTML = `<div class="transcript-notice">${escapeHTML(error.message)}</div>`; }
@@ -94,7 +94,7 @@ async function openEpisode(episodeId) {
     $('#home-view').hidden = true; $('#player-view').hidden = false;
     $('#player-title').textContent = titleOf(item);
     const feed = state.feeds.find((candidate) => String(idOf(candidate)) === String(item.feed_id));
-    const mediaItem = { ...item, feed_title: item.feed_title || item.show_title || feed?.title || 'ポッドキャスト', image_url: item.image_url || feed?.image_url || '' };
+    const mediaItem = { ...item, feed_title: item.feed_title || item.show_title || feed?.title || 'Podcast', image_url: item.image_url || feed?.image_url || '' };
     $('#player-show').textContent = mediaItem.feed_title.toUpperCase();
     updateMediaMetadata(mediaItem);
     audio.src = item.audio_path || item.audio_url || item.enclosure_url || item.url || '';
@@ -128,17 +128,17 @@ async function openEpisode(episodeId) {
     else { state.segments = []; renderTranscript(); setTranscriptStatus('missing'); }
     window.scrollTo({ top: 0, behavior: 'smooth' });
   } catch (error) {
-    if (requestId === state.episodeRequestId) { state.episodeLoading = false; $('#transcribe-button').disabled = false; showToast(`エピソードを開けませんでした: ${error.message}`); }
+    if (requestId === state.episodeRequestId) { state.episodeLoading = false; $('#transcribe-button').disabled = false; showToast(`Could not open episode: ${error.message}`); }
   }
 }
 
 function setTranscriptStatus(status, message = '') {
   const badge = $('#transcript-status'); const button = $('#transcribe-button'); const notice = $('#transcript-notice');
   badge.classList.toggle('pending', status === 'pending');
-  if (status === 'ready') { badge.textContent = '文字起こし済み'; button.hidden = true; notice.hidden = true; }
-  else if (status === 'pending') { badge.textContent = '文字起こし中'; button.hidden = true; notice.hidden = false; notice.textContent = 'CPU で文字起こし中です。準備ができるまでこの画面を開いておけます。'; }
-  else if (status === 'error') { badge.textContent = '文字起こし失敗'; button.hidden = false; notice.hidden = false; notice.textContent = message || '文字起こしに失敗しました。再試行できます。'; }
-  else { badge.textContent = '未作成'; button.hidden = false; notice.hidden = false; notice.textContent = 'このエピソードの文字起こしはまだありません。作成すると、単語をタップしてその位置から再生できます。'; }
+  if (status === 'ready') { badge.textContent = 'Transcript ready'; button.hidden = true; notice.hidden = true; }
+  else if (status === 'pending') { badge.textContent = 'Transcribing'; button.hidden = true; notice.hidden = false; notice.textContent = 'Transcribing on CPU. You can return later.'; }
+  else if (status === 'error') { badge.textContent = 'Transcription failed'; button.hidden = false; notice.hidden = false; notice.textContent = message || 'Transcription failed. You can try again.'; }
+  else { badge.textContent = 'Not created'; button.hidden = false; notice.hidden = false; notice.textContent = 'This episode has no transcript yet. Create one to tap any word and play from that point.'; }
 }
 
 function renderTranscript() {
@@ -156,7 +156,7 @@ function renderTranscript() {
       return `${space}<span class="word" data-line="${index}" data-word="${wordIndex}" data-start="${wordStart}" data-end="${wordEnd}">${escapeHTML(text)}</span>`;
     }).join('') : escapeHTML(segment.text || '');
     if (!words.length) wordsHTML = `<span class="word" data-line="${index}" data-word="0" data-start="${start}" data-end="${end}">${wordsHTML}</span>`;
-    return `<article class="transcript-line" data-line="${index}" data-start="${start}" data-end="${end}"><button type="button" class="line-time" data-play-line="${index}" aria-label="${fmtTime(start)} から再生">${fmtTime(start)}</button><span class="line-text">${wordsHTML}</span><button class="line-loop" data-loop-line="${index}" aria-label="この一文をリピート" aria-pressed="false">↻</button></article>`;
+    return `<article class="transcript-line" data-line="${index}" data-start="${start}" data-end="${end}"><button type="button" class="line-time" data-play-line="${index}" aria-label="Play from ${fmtTime(start)}">${fmtTime(start)}</button><span class="line-text">${wordsHTML}</span><button class="line-loop" data-loop-line="${index}" aria-label="Repeat this sentence" aria-pressed="false">↻</button></article>`;
   }).join('');
 }
 
@@ -164,24 +164,24 @@ async function startTranscription() {
   if (!state.episode || state.episodeLoading) return;
   const requestId = state.episodeRequestId;
   const episodeId = idOf(state.episode);
-  const button = $('#transcribe-button'); button.disabled = true; button.textContent = '開始しています…'; setTranscriptStatus('pending');
+  const button = $('#transcribe-button'); button.disabled = true; button.textContent = 'Starting…'; setTranscriptStatus('pending');
   try {
     const result = await api(`/api/episodes/${encodeURIComponent(episodeId)}/transcribe`, { method: 'POST', body: '{}' });
     if (requestId !== state.episodeRequestId) return;
     const jobId = result.job_id || result.id;
     if (result.transcript?.segments?.length || result.segments?.length) { state.segments = result.transcript?.segments || result.segments; renderTranscript(); setTranscriptStatus('ready'); }
     else { pollTranscript(episodeId, jobId, requestId); }
-    showToast('文字起こしを始めました');
+    showToast('Transcription started');
   } catch (error) {
     if (requestId !== state.episodeRequestId) return;
     if (error.status === 409) {
       const transcript = transcriptData(await api(`/api/episodes/${encodeURIComponent(episodeId)}/transcript`).catch(() => ({})));
       if (requestId !== state.episodeRequestId) return;
-      if (['queued', 'downloading', 'processing'].includes(transcript.status)) { setTranscriptStatus('pending'); pollTranscript(episodeId); showToast('文字起こしはすでに進行中です'); }
-      else { setTranscriptStatus('error', error.message); showToast(`開始できませんでした: ${error.message}`); }
-    } else { setTranscriptStatus('error', error.message); showToast(`開始できませんでした: ${error.message}`); }
+      if (['queued', 'downloading', 'processing'].includes(transcript.status)) { setTranscriptStatus('pending'); pollTranscript(episodeId); showToast('Transcription is already in progress'); }
+      else { setTranscriptStatus('error', error.message); showToast(`Could not start transcription: ${error.message}`); }
+    } else { setTranscriptStatus('error', error.message); showToast(`Could not start transcription: ${error.message}`); }
   }
-  finally { if (requestId === state.episodeRequestId) { button.disabled = false; button.innerHTML = '文字起こしを作る <span>✳</span>'; } }
+  finally { if (requestId === state.episodeRequestId) { button.disabled = false; button.innerHTML = 'Create transcript <span>✳</span>'; } }
 }
 
 function pollTranscript(episodeId, jobId = null, requestId = state.episodeRequestId) {
@@ -198,14 +198,14 @@ function pollTranscript(episodeId, jobId = null, requestId = state.episodeReques
         const job = await api(`/api/jobs/${encodeURIComponent(jobId)}`);
         if (requestId !== state.episodeRequestId) { clearInterval(timer); return; }
         const status = job.status || job.state;
-        if (status === 'failed' || status === 'error') { clearInterval(timer); if (state.pollTimer === timer) state.pollTimer = null; setTranscriptStatus('error', job.error || '文字起こしに失敗しました。'); return; }
+        if (status === 'failed' || status === 'error') { clearInterval(timer); if (state.pollTimer === timer) state.pollTimer = null; setTranscriptStatus('error', job.error || 'Transcription failed.'); return; }
       }
       const result = await api(`/api/episodes/${encodeURIComponent(episodeId)}/transcript`);
       if (requestId !== state.episodeRequestId) { clearInterval(timer); return; }
       const transcript = transcriptData(result);
-      if (transcript.segments.length) { clearInterval(timer); if (state.pollTimer === timer) state.pollTimer = null; state.segments = transcript.segments; renderTranscript(); setTranscriptStatus('ready'); showToast('文字起こしができました'); }
-      else if (transcript.status === 'error') { clearInterval(timer); if (state.pollTimer === timer) state.pollTimer = null; setTranscriptStatus('error', result.error || '文字起こしに失敗しました。'); }
-      else if (attempts > 180) { clearInterval(timer); if (state.pollTimer === timer) state.pollTimer = null; setTranscriptStatus('missing'); showToast('処理に時間がかかっています。少し後で再度確認してください。'); }
+      if (transcript.segments.length) { clearInterval(timer); if (state.pollTimer === timer) state.pollTimer = null; state.segments = transcript.segments; renderTranscript(); setTranscriptStatus('ready'); showToast('Transcript ready'); }
+      else if (transcript.status === 'error') { clearInterval(timer); if (state.pollTimer === timer) state.pollTimer = null; setTranscriptStatus('error', result.error || 'Transcription failed.'); }
+      else if (attempts > 180) { clearInterval(timer); if (state.pollTimer === timer) state.pollTimer = null; setTranscriptStatus('missing'); showToast('This is taking longer than expected. Check again in a little while.'); }
     } catch (error) {
       if (requestId !== state.episodeRequestId) { clearInterval(timer); return; }
       if (error.status === 404 && jobId) {
@@ -213,10 +213,10 @@ function pollTranscript(episodeId, jobId = null, requestId = state.episodeReques
         if (requestId !== state.episodeRequestId) { clearInterval(timer); return; }
         const transcript = transcriptData(result);
         if (transcript.segments.length) { clearInterval(timer); if (state.pollTimer === timer) state.pollTimer = null; state.segments = transcript.segments; renderTranscript(); setTranscriptStatus('ready'); return; }
-        if (transcript.status === 'error') { clearInterval(timer); if (state.pollTimer === timer) state.pollTimer = null; setTranscriptStatus('error', result.error || '文字起こしに失敗しました。'); return; }
-        if (!['queued', 'downloading', 'processing'].includes(transcript.status)) { clearInterval(timer); if (state.pollTimer === timer) state.pollTimer = null; setTranscriptStatus('error', '文字起こしの状態を確認できません。再試行してください。'); return; }
+        if (transcript.status === 'error') { clearInterval(timer); if (state.pollTimer === timer) state.pollTimer = null; setTranscriptStatus('error', result.error || 'Transcription failed.'); return; }
+        if (!['queued', 'downloading', 'processing'].includes(transcript.status)) { clearInterval(timer); if (state.pollTimer === timer) state.pollTimer = null; setTranscriptStatus('error', 'Could not check transcription status. Please try again.'); return; }
       }
-      if (attempts > 180) { clearInterval(timer); if (state.pollTimer === timer) state.pollTimer = null; setTranscriptStatus('error', error.message || '文字起こしの状態を確認できません。'); }
+      if (attempts > 180) { clearInterval(timer); if (state.pollTimer === timer) state.pollTimer = null; setTranscriptStatus('error', error.message || 'Could not check transcription status. Please try again.'); }
     } finally { inFlight = false; }
   }, 4000);
   state.pollTimer = timer;
@@ -227,7 +227,7 @@ function setLoop(index, enabled = true) {
   document.querySelectorAll('.line-loop').forEach((button) => {
     const active = Number(button.dataset.loopLine) === state.loopLine;
     button.setAttribute('aria-pressed', String(active));
-    button.setAttribute('aria-label', active ? 'この一文のリピートを解除' : 'この一文をリピート');
+    button.setAttribute('aria-label', active ? 'Stop repeating this sentence' : 'Repeat this sentence');
   });
   $('#repeat-button').classList.toggle('active', state.loopLine >= 0);
   $('#repeat-button').setAttribute('aria-pressed', String(state.loopLine >= 0));
@@ -292,7 +292,7 @@ function updateMediaMetadata(item) {
 function updatePlayButton() {
   const playing = !audio.paused && !audio.ended;
   $('#play-button').classList.toggle('playing', playing);
-  $('#play-button').setAttribute('aria-label', playing ? '一時停止' : '再生');
+  $('#play-button').setAttribute('aria-label', playing ? 'Pause' : 'Play');
   $('#play-button').setAttribute('aria-pressed', String(playing));
   if (navigator.mediaSession) { try { navigator.mediaSession.playbackState = playing ? 'playing' : 'paused'; } catch { /* Optional browser integration. */ } }
 }
@@ -373,10 +373,10 @@ $('#cancel-add').addEventListener('click', () => { $('#add-feed-panel').hidden =
 $('#empty-add').addEventListener('click', () => { $('#add-feed-panel').hidden = false; $('#feed-url').focus(); });
 $('#add-feed-form').addEventListener('submit', async (event) => {
   event.preventDefault(); const input = $('#feed-url'); const button = event.currentTarget.querySelector('button[type="submit"]');
-  button.disabled = true; button.textContent = '読み込み中…';
-  try { await api('/api/feeds', { method: 'POST', body: JSON.stringify({ url: input.value.trim() }) }); input.value = ''; $('#add-feed-panel').hidden = true; await loadFeeds(); showToast('番組をライブラリに追加しました'); }
-  catch (error) { showToast(`登録できませんでした: ${error.message}`); }
-  finally { button.disabled = false; button.innerHTML = '追加する <span>↗</span>'; }
+  button.disabled = true; button.textContent = 'Loading…';
+  try { await api('/api/feeds', { method: 'POST', body: JSON.stringify({ url: input.value.trim() }) }); input.value = ''; $('#add-feed-panel').hidden = true; await loadFeeds(); showToast('Podcast added to your library'); }
+  catch (error) { showToast(`Could not add podcast: ${error.message}`); }
+  finally { button.disabled = false; button.innerHTML = 'Add <span>↗</span>'; }
 });
 $('#feed-list').addEventListener('click', (event) => { const card = event.target.closest('[data-feed-id]'); if (card) openFeed(card.dataset.feedId); });
 $('#episode-list').addEventListener('click', (event) => { const button = event.target.closest('[data-episode-id]'); if (button) openEpisode(button.dataset.episodeId); });
@@ -387,14 +387,14 @@ $('#follow-playback').addEventListener('click', () => setPlaybackFollow(true));
 $('#transcript-lines').addEventListener('click', (event) => {
   const seekLine = event.target.closest('[data-play-line]');
   if (seekLine) {
-    if (state.loopLine >= 0) { setLoop(-1); showToast('一文リピートを解除しました'); }
+    if (state.loopLine >= 0) { setLoop(-1); showToast('Sentence repeat turned off'); }
     activateLine(Number(seekLine.dataset.playLine), true); savePosition(true); return;
   }
   const loop = event.target.closest('[data-loop-line]');
   if (loop) { const index = Number(loop.dataset.loopLine); const enabling = state.loopLine !== index; setLoop(enabling ? index : -1); if (enabling) activateLine(index, true); return; }
   const word = event.target.closest('.word'); if (word) {
     const index = Number(word.dataset.line);
-    if (state.loopLine >= 0) { setLoop(-1); showToast('一文リピートを解除しました'); }
+    if (state.loopLine >= 0) { setLoop(-1); showToast('Sentence repeat turned off'); }
     activateLine(index, false);
     audio.currentTime = Number(word.dataset.start) || 0;
     audio.play().catch(() => {}); savePosition(true);
@@ -416,7 +416,7 @@ $('#rewind-button').addEventListener('click', () => { audio.currentTime = Math.m
 $('#forward-button').addEventListener('click', () => { audio.currentTime = Math.min(audio.duration || Infinity, audio.currentTime + 30); });
 $('#repeat-button').addEventListener('click', () => {
   const index = state.activeLine >= 0 ? state.activeLine : 0;
-  if (!state.segments[index]) { showToast('文字起こしができると、一文リピートを使えます'); return; }
+  if (!state.segments[index]) { showToast('Create a transcript to repeat a sentence'); return; }
   const enabling = state.loopLine !== index;
   setLoop(enabling ? index : -1);
   if (enabling) activateLine(index, true);
@@ -456,4 +456,4 @@ if (navigator.mediaSession) {
   for (const [action, handler] of Object.entries(actions)) { try { navigator.mediaSession.setActionHandler(action, handler); } catch { /* Action is unsupported by this browser. */ } }
 }
 
-loadFeeds().catch((error) => { $('#empty-library').hidden = false; $('#empty-library').querySelector('p').textContent = `API に接続できませんでした: ${error.message}`; });
+loadFeeds().catch((error) => { $('#empty-library').hidden = false; $('#empty-library').querySelector('p').textContent = `Could not connect to the API: ${error.message}`; });
