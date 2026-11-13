@@ -36,6 +36,12 @@ The default speech model is `small.en`. On its first use, faster-whisper downloa
 3. Choose **Create transcript**. The episode audio is downloaded and cached, then transcription begins. Progress is shown on the episode screen.
 4. When the transcript is ready, press play. Tap any word to jump to that point, or use the repeat control beside a sentence to practice it again.
 
+## Automatic transcripts for new episodes
+
+LinguaCast checks registered RSS feeds for new releases while its server is running. It checks every 15 minutes by default; set `AUTO_REFRESH_INTERVAL_SECONDS` to change the interval. Automatic transcription starts only for episodes published after a feed was registered. Episodes already in the feed at registration are the baseline and are not transcribed automatically, so this does not create a backlog. When upgrading an existing library, the episodes currently in each feed become its baseline. Episodes with a missing, invalid, or older publication date are skipped because LinguaCast cannot reliably determine that they are new.
+
+The server downloads eligible episode audio and transcribes it on the CPU, one episode at a time. The episode list shows whether a transcript is queued, downloading, in progress, ready, or failed. A failed episode can be retried from its player screen with **Create transcript**. Keep the LinguaCast server running for feed checks and automatic transcription; opening the app in a browser is not required. Automatic jobs that were queued or in progress when the server stopped resume after restart. Interrupted manual jobs are marked failed and can be retried from the episode screen.
+
 An Apple Podcasts **share link** points to an episode page and is not the RSS feed URL LinguaCast expects. Look for the podcast's RSS link on its website or in the podcast provider's settings. Some providers give subscribers a private RSS URL; treat it like a password because it may contain an access token.
 
 ## Use it from an iPhone
@@ -67,7 +73,7 @@ WHISPER_MODEL=base.en uvicorn app:app --host 127.0.0.1 --port 8000
 - Feed details, episode records, transcripts, and downloaded episode audio are stored locally in `data/` by default. Change the location with `PODCAST_DATA_DIR=/path/to/data`.
 - The downloaded speech model is cached by faster-whisper in the user's Hugging Face cache, separately from `data/`.
 - Playback position and speed are saved in the current browser's local storage. They are not synced between devices.
-- Transcription jobs are held in memory. If the server restarts during a job, retry that episode after restarting.
+- Automatic RSS checks and transcription run only while the LinguaCast server is running. The default check interval is 15 minutes and can be changed with `AUTO_REFRESH_INTERVAL_SECONDS`.
 - Transcription is English-focused and may make mistakes, especially with noisy audio, accents, music, or specialized vocabulary. Word timing and sentence boundaries are generated automatically and may need interpretation.
 - LinguaCast reads RSS/Atom feeds that include HTTP(S) audio enclosures. It does not extract an RSS feed URL from an Apple Podcasts share link.
 

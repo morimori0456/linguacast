@@ -1,9 +1,10 @@
 """Local podcast RSS reader backend with asynchronous CPU transcription."""
 from __future__ import annotations
 
-import hashlib, json, os, re, sqlite3, threading, urllib.error, urllib.parse, urllib.request, uuid
+import asyncio, hashlib, json, logging, os, re, sqlite3, threading, urllib.error, urllib.parse, urllib.request, uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
@@ -23,7 +24,13 @@ app = FastAPI(title="Podcast Reader", version="0.1.0")
 executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="transcription")
 job_lock = threading.Lock()
 jobs: dict[str, dict[str, Any]] = {}
+_active_episode_jobs: set[int] = set()
+AUTO_REFRESH_INTERVAL_SECONDS = max(30, int(os.environ.get("AUTO_REFRESH_INTERVAL_SECONDS", "900")))
+_refresh_lock = threading.Lock()
+_scheduler_stop: asyncio.Event | None = None
+_scheduler_task: asyncio.Task | None = None
 USER_AGENT = "PodcastReader/0.1 (personal RSS reader)"
+logger = logging.getLogger(__name__)
 
 def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=30)
@@ -37,12 +44,130 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS feeds(id INTEGER PRIMARY KEY,url TEXT NOT NULL UNIQUE,title TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',image_url TEXT NOT NULL DEFAULT '',added_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS episodes(id INTEGER PRIMARY KEY,feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE CASCADE,guid TEXT NOT NULL,title TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',audio_url TEXT NOT NULL,published_at TEXT NOT NULL DEFAULT '',duration TEXT NOT NULL DEFAULT '',transcript_json TEXT,transcript_status TEXT NOT NULL DEFAULT 'none',transcript_error TEXT NOT NULL DEFAULT '',local_audio TEXT,UNIQUE(feed_id,guid));
         """)
-        # Job state is intentionally in memory. Let interrupted jobs be retried after restart.
-        c.execute("UPDATE episodes SET transcript_status='error',transcript_error='Transcription was interrupted by a server restart. Retry it.' WHERE transcript_status IN ('queued','downloading','processing')")
+        # Additive migrations preserve existing local feeds, episodes, and transcripts.
+        feed_columns = {r[1] for r in c.execute("PRAGMA table_info(feeds)")}
+        if "auto_since" not in feed_columns:
+            c.execute("ALTER TABLE feeds ADD COLUMN auto_since TEXT")
+        if "last_poll_at" not in feed_columns:
+            c.execute("ALTER TABLE feeds ADD COLUMN last_poll_at TEXT")
+        if "last_poll_error" not in feed_columns:
+            c.execute("ALTER TABLE feeds ADD COLUMN last_poll_error TEXT NOT NULL DEFAULT ''")
+        episode_columns = {r[1] for r in c.execute("PRAGMA table_info(episodes)")}
+        if "transcript_origin" not in episode_columns:
+            c.execute("ALTER TABLE episodes ADD COLUMN transcript_origin TEXT NOT NULL DEFAULT 'manual'")
+        if "auto_eligible" not in episode_columns:
+            c.execute("ALTER TABLE episodes ADD COLUMN auto_eligible INTEGER NOT NULL DEFAULT 0")
+        if "publication_time" not in episode_columns:
+            c.execute("ALTER TABLE episodes ADD COLUMN publication_time TEXT NOT NULL DEFAULT ''")
+        # Existing feeds are activated at upgrade time: their current archive is baseline.
+        now = datetime.now(timezone.utc).isoformat()
+        c.execute("UPDATE feeds SET auto_since=? WHERE auto_since IS NULL OR auto_since=''", (now,))
+        # Non-auto in-flight jobs were never durable; retain the previous retry behavior.
+        c.execute("UPDATE episodes SET transcript_status='error',transcript_error='Transcription was interrupted by a server restart. Retry it.' WHERE transcript_status IN ('queued','downloading','processing') AND transcript_origin!='auto'")
+
+def _new_job(eid: int) -> str | None:
+    jid = str(uuid.uuid4())
+    with job_lock:
+        if eid in _active_episode_jobs:
+            return None
+        _active_episode_jobs.add(eid)
+        jobs[jid] = {"id": jid, "episode_id": eid, "status": "queued", "progress": 0}
+    return jid
+
+def _submit_job(eid: int, jid: str) -> bool:
+    """Submit work or persist a terminal error if the executor is unavailable."""
+    try:
+        future = executor.submit(transcribe_worker, eid, jid)
+        future.add_done_callback(lambda f: _job_cancelled(eid, jid, f))
+        return True
+    except RuntimeError as e:
+        message = f"Transcription could not be queued: {e}"[:500]
+        set_state(eid, "error", error=message)
+        with job_lock:
+            _active_episode_jobs.discard(eid)
+            if jid in jobs:
+                jobs[jid].update(status="error", progress=0, error=message)
+        return False
+
+def _job_cancelled(eid: int, jid: str, future: Any) -> None:
+    if not future.cancelled():
+        return
+    with db() as c:
+        row = c.execute("SELECT transcript_origin FROM episodes WHERE id=?", (eid,)).fetchone()
+    # Automatic work stays durably queued for the next process start. Manual work
+    # is surfaced as an error because it is not part of automatic recovery.
+    if row is not None and row["transcript_origin"] != "auto":
+        set_state(eid, "error", error="Transcription was interrupted by server shutdown. Retry it.")
+        with job_lock:
+            if jid in jobs:
+                jobs[jid].update(status="error", progress=0, error="Transcription was interrupted by server shutdown. Retry it.")
+    with job_lock:
+        _active_episode_jobs.discard(eid)
+
+def enqueue_episode(eid: int, origin: str = "auto", allow_ready: bool = False) -> str | None:
+    """Atomically claim a transcript and enqueue it on the one-worker CPU queue."""
+    jid: str | None = None
+    with db() as c:
+        row = c.execute("SELECT transcript_status FROM episodes WHERE id=?", (eid,)).fetchone()
+        if row is None or row["transcript_status"] in {"queued", "downloading", "processing"} or (row["transcript_status"] == "ready" and not allow_ready):
+            return None
+        condition = "transcript_status NOT IN ('queued','downloading','processing','ready')" if not allow_ready else "transcript_status NOT IN ('queued','downloading','processing')"
+        cur = c.execute(f"UPDATE episodes SET transcript_status='queued',transcript_error='',transcript_origin=? WHERE id=? AND {condition}", (origin, eid))
+        if not cur.rowcount:
+            return None
+        jid = _new_job(eid)
+    if jid is None:
+        return None
+    if not _submit_job(eid, jid):
+        raise HTTPException(503, "Transcription queue is unavailable")
+    return jid
+
+def recover_auto_jobs() -> int:
+    """Resume durable automatic jobs once at server startup; failures do not loop."""
+    with db() as c:
+        # Queued jobs survive a crash. A worker interrupted while downloading/model
+        # execution was in progress is also safe to resume once.
+        c.execute("UPDATE episodes SET transcript_status='queued',transcript_error='' WHERE transcript_origin='auto' AND transcript_status IN ('downloading','processing')")
+        ids = [r[0] for r in c.execute("SELECT id FROM episodes WHERE transcript_origin='auto' AND transcript_status='queued' ORDER BY id")]
+    for eid in ids:
+        jid = _new_job(eid)
+        if jid is not None:
+            _submit_job(eid, jid)
+    return len(ids)
+
+async def _auto_refresh_loop() -> None:
+    assert _scheduler_stop is not None
+    while not _scheduler_stop.is_set():
+        try:
+            await poll_feeds_once(_scheduler_stop)
+        except Exception:
+            # A failed poll must not stop future polling.
+            pass
+        try:
+            await asyncio.wait_for(_scheduler_stop.wait(), timeout=AUTO_REFRESH_INTERVAL_SECONDS)
+        except asyncio.TimeoutError:
+            pass
 
 @app.on_event("startup")
-def startup() -> None:
+async def startup() -> None:
+    global _scheduler_stop, _scheduler_task
     init_db()
+    recover_auto_jobs()
+    _scheduler_stop = asyncio.Event()
+    _scheduler_task = asyncio.create_task(_auto_refresh_loop(), name="rss-auto-refresh")
+
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    global _scheduler_stop, _scheduler_task
+    if _scheduler_stop is not None:
+        _scheduler_stop.set()
+    if _scheduler_task is not None:
+        await _scheduler_task
+    # Running work may finish in its worker thread; queued work is canceled. Auto
+    # jobs remain persisted as queued and are recovered on the next server start.
+    executor.shutdown(wait=False, cancel_futures=True)
+    _scheduler_stop = None
+    _scheduler_task = None
 
 def val(el: ET.Element | None, default: str = "") -> str:
     if el is None: return default
@@ -94,6 +219,7 @@ def parse_feed(url: str) -> tuple[dict[str, str], list[dict[str, str]]]:
         episodes.append({"guid": guid, "title": val(child(item, "title"), "Untitled episode"),
           "description": val(child(item, "description"), val(child(item, "summary"))),
           "audio_url": urllib.parse.urljoin(url, audio), "published_at": val(child(item, "pubDate"), val(child(item, "published"), val(child(item, "updated")))),
+          "publication_time": val(child(item, "pubDate"), val(child(item, "published"))),
           "duration": val(child(item, "duration"))})
     return {"title": title, "description": desc, "image_url": image}, episodes
 
@@ -117,14 +243,15 @@ def list_feeds() -> list[dict[str, Any]]:
 @app.post("/api/feeds")
 def add_feed(payload: FeedInput) -> dict[str, Any]:
     url = str(payload.url); meta, eps = parse_feed(url)
+    activated = datetime.now(timezone.utc).isoformat()
     with db() as c:
         try:
-            cur = c.execute("INSERT INTO feeds(url,title,description,image_url,added_at) VALUES(?,?,?,?,?)", (url, meta["title"], meta["description"], meta["image_url"], datetime.now(timezone.utc).isoformat()))
+            cur = c.execute("INSERT INTO feeds(url,title,description,image_url,added_at,auto_since) VALUES(?,?,?,?,?,?)", (url, meta["title"], meta["description"], meta["image_url"], activated, activated))
         except sqlite3.IntegrityError: raise HTTPException(409, "This RSS feed is already registered")
         fid = cur.lastrowid
         # RSS feeds normally list newest episodes first; insertion is reversed because
         # the episode endpoint returns rows newest-id-first.
-        c.executemany("INSERT OR IGNORE INTO episodes(feed_id,guid,title,description,audio_url,published_at,duration) VALUES(?,?,?,?,?,?,?)", [(fid,e["guid"],e["title"],e["description"],e["audio_url"],e["published_at"],e["duration"]) for e in reversed(eps)])
+        c.executemany("INSERT OR IGNORE INTO episodes(feed_id,guid,title,description,audio_url,published_at,duration,publication_time) VALUES(?,?,?,?,?,?,?,?)", [(fid,e["guid"],e["title"],e["description"],e["audio_url"],e["published_at"],e["duration"],e["publication_time"]) for e in reversed(eps)])
         row = c.execute("SELECT * FROM feeds WHERE id=?", (fid,)).fetchone()
     return {**feed_json(row), "episode_count": len(eps)}
 
@@ -137,14 +264,71 @@ def delete_feed(feed_id: int) -> dict[str, bool]:
 
 @app.post("/api/feeds/{feed_id}/refresh")
 def refresh_feed(feed_id: int) -> dict[str, int]:
-    with db() as c: feed = c.execute("SELECT * FROM feeds WHERE id=?", (feed_id,)).fetchone()
-    if feed is None: raise HTTPException(404, "Feed not found")
-    meta, eps = parse_feed(feed["url"])
-    with db() as c:
-        c.execute("UPDATE feeds SET title=?,description=?,image_url=? WHERE id=?", (meta["title"],meta["description"],meta["image_url"],feed_id))
-        c.executemany("INSERT OR IGNORE INTO episodes(feed_id,guid,title,description,audio_url,published_at,duration) VALUES(?,?,?,?,?,?,?)", [(feed_id,e["guid"],e["title"],e["description"],e["audio_url"],e["published_at"],e["duration"]) for e in reversed(eps)])
-        count = c.execute("SELECT COUNT(*) FROM episodes WHERE feed_id=?", (feed_id,)).fetchone()[0]
-    return {"episode_count": count}
+    return {"episode_count": refresh_feed_internal(feed_id)}
+
+def _published_time(value: str) -> datetime | None:
+    """Parse RSS/Atom publication timestamps; unknown values are ineligible."""
+    if not value or not value.strip(): return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        try: parsed = parsedate_to_datetime(value.strip())
+        except (TypeError, ValueError, OverflowError): return None
+    if parsed is None or parsed.tzinfo is None: return None
+    return parsed.astimezone(timezone.utc)
+
+def refresh_feed_internal(feed_id: int, auto_queue: bool = True) -> int:
+    """Shared manual/scheduled RSS refresh. New eligible rows and auto queue state commit together."""
+    queued_ids: list[int] = []
+    with _refresh_lock:
+        with db() as c: feed = c.execute("SELECT * FROM feeds WHERE id=?", (feed_id,)).fetchone()
+        if feed is None: raise HTTPException(404, "Feed not found")
+        meta, eps = parse_feed(feed["url"])
+        activation = _published_time(feed["auto_since"] or "")
+        now = datetime.now(timezone.utc)
+        with db() as c:
+            c.execute("UPDATE feeds SET title=?,description=?,image_url=? WHERE id=?", (meta["title"],meta["description"],meta["image_url"],feed_id))
+            # Insert in feed order expected by the API (newest rows get largest ids).
+            for e in reversed(eps):
+                cur = c.execute("INSERT OR IGNORE INTO episodes(feed_id,guid,title,description,audio_url,published_at,duration,publication_time) VALUES(?,?,?,?,?,?,?,?)", (feed_id,e["guid"],e["title"],e["description"],e["audio_url"],e["published_at"],e["duration"],e["publication_time"]))
+                if cur.rowcount and auto_queue and activation is not None:
+                    published = _published_time(e["publication_time"])
+                    if published is not None and published >= activation:
+                        eid = cur.lastrowid
+                        c.execute("UPDATE episodes SET auto_eligible=1 WHERE id=?", (eid,))
+            if auto_queue and activation is not None:
+                candidates = c.execute("SELECT id,publication_time FROM episodes WHERE feed_id=? AND auto_eligible=1 AND transcript_status='none'", (feed_id,)).fetchall()
+                for candidate in candidates:
+                    published = _published_time(candidate["publication_time"])
+                    if published is not None and activation <= published <= now:
+                        eid = candidate["id"]
+                        c.execute("UPDATE episodes SET transcript_status='queued',transcript_error='',transcript_origin='auto' WHERE id=? AND transcript_status='none'", (eid,))
+                        if c.execute("SELECT changes()").fetchone()[0]: queued_ids.append(eid)
+            count = c.execute("SELECT COUNT(*) FROM episodes WHERE feed_id=?", (feed_id,)).fetchone()[0]
+    # Durable queued statuses are already committed before work reaches the executor.
+    for eid in queued_ids:
+        jid = _new_job(eid)
+        if jid is not None:
+            _submit_job(eid, jid)
+    return count
+
+async def poll_feeds_once(stop_event: asyncio.Event | None = None) -> None:
+    """Poll feeds serially, isolating per-feed errors so one bad URL cannot stall others."""
+    with db() as c: feed_ids = [r[0] for r in c.execute("SELECT id FROM feeds ORDER BY id")]
+    for feed_id in feed_ids:
+        if stop_event is not None and stop_event.is_set():
+            return
+        try:
+            await asyncio.to_thread(refresh_feed_internal, feed_id, True)
+            with db() as c:
+                c.execute("UPDATE feeds SET last_poll_at=?,last_poll_error='' WHERE id=?", (datetime.now(timezone.utc).isoformat(), feed_id))
+        except Exception as e:
+            logger.warning("RSS auto-refresh failed for feed_id=%s (%s)", feed_id, type(e).__name__)
+            # Keep a generic, non-secret user-visible status without persisting URLs
+            # or the exception text, which may contain request details.
+            with db() as c:
+                c.execute("UPDATE feeds SET last_poll_at=?,last_poll_error=? WHERE id=?", (datetime.now(timezone.utc).isoformat(), f"RSS refresh failed ({type(e).__name__})", feed_id))
+            continue
 
 @app.get("/api/feeds/{feed_id}/episodes")
 def list_episodes(feed_id: int) -> list[dict[str, Any]]:
@@ -279,14 +463,15 @@ def transcribe_worker(eid: int, jid: str) -> None:
         try: set_state(eid,"error",error=message)
         except Exception: pass
         with job_lock: jobs[jid].update(status="error",progress=0,error=message)
+    finally:
+        with job_lock:
+            _active_episode_jobs.discard(eid)
 
 @app.post("/api/episodes/{episode_id}/transcribe",status_code=202)
 def start_transcription(episode_id: int) -> dict[str, str]:
-    row = get_episode(episode_id)
-    if row["transcript_status"] in {"queued","downloading","processing"}: raise HTTPException(409,"Transcription is already in progress")
-    jid = str(uuid.uuid4()); set_state(episode_id,"queued",error="")
-    with job_lock: jobs[jid] = {"id":jid,"episode_id":episode_id,"status":"queued","progress":0}
-    executor.submit(transcribe_worker,episode_id,jid)
+    get_episode(episode_id)
+    jid = enqueue_episode(episode_id, "manual", allow_ready=True)
+    if jid is None: raise HTTPException(409,"Transcription is already in progress")
     return {"job_id":jid,"status":"queued"}
 
 @app.get("/api/episodes/{episode_id}/transcript")

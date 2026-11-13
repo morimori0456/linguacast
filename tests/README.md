@@ -1,5 +1,15 @@
 # Player acceptance test
 
+The backend suite in `test_auto_transcription.py` uses a temporary SQLite database,
+synthetic feeds, and a mocked transcription executor. It verifies the initial feed
+baseline, date eligibility, duplicate and concurrent refresh behavior, manual queue
+deduplication, automatic job recovery, and isolation of feed failures. It does not
+download audio or load a speech model. Run it alone with:
+
+```sh
+python -m unittest tests.test_auto_transcription -v
+```
+
 This Playwright test drives the app in a 390 × 844 mobile viewport. It stubs the app API and creates a short WAV in memory, so it does not contact podcast feeds, download model weights, or transcribe real audio.
 
 ## Setup
