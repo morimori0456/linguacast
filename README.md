@@ -76,7 +76,7 @@ To use translations, install and sign in to `agy` on the machine running LinguaC
 
 **Privacy:** Translation is on demand. When you tap a sentence for the first time, only that transcript sentence is sent to Google through `agy`; LinguaCast does not send the episode audio or the full transcript for the translation request. The sentence and its translation are cached on the LinguaCast server. Do not use this feature for text you do not want to send to Google. Speech recognition remains local and uses faster-whisper; it does not use `agy` or send audio to Google. Playback and local transcription do not require an `agy` login.
 
-The `agy` integration has offline, mocked tests. Actual provider execution, Google account authorization, and current account quotas have not been verified as part of those tests.
+The `agy` integration includes offline, mocked tests. An authenticated synthetic translation was also verified in a systemd user service; account availability and quotas depend on your own environment.
 
 ## Data and limitations
 
