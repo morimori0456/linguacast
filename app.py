@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, HttpUrl
-from translation_runner import DEFAULT_MODEL as DEFAULT_AGY_TRANSLATION_MODEL, MAX_BATCH_INPUT_CHARS, MAX_BATCH_SENTENCES, TranslationRunnerError, translate_sentence, translate_sentences
+from translation_runner import DEFAULT_MODEL as DEFAULT_AGY_TRANSLATION_MODEL, MAX_BATCH_INPUT_CHARS, MAX_BATCH_SENTENCES, TranslationRunnerError, translate_sentence_with_expressions, translate_sentences_with_expressions
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("PODCAST_DATA_DIR", BASE_DIR / "data")).resolve()
@@ -55,11 +55,15 @@ def init_db() -> None:
         c.executescript("""
         CREATE TABLE IF NOT EXISTS feeds(id INTEGER PRIMARY KEY,url TEXT NOT NULL UNIQUE,title TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',image_url TEXT NOT NULL DEFAULT '',added_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS episodes(id INTEGER PRIMARY KEY,feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE CASCADE,guid TEXT NOT NULL,title TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',audio_url TEXT NOT NULL,published_at TEXT NOT NULL DEFAULT '',duration TEXT NOT NULL DEFAULT '',transcript_json TEXT,transcript_status TEXT NOT NULL DEFAULT 'none',transcript_error TEXT NOT NULL DEFAULT '',local_audio TEXT,UNIQUE(feed_id,guid));
-        CREATE TABLE IF NOT EXISTS sentence_translations(episode_id INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,content_key TEXT NOT NULL,target_language TEXT NOT NULL,provider TEXT NOT NULL,model TEXT NOT NULL,translation TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(episode_id,content_key,target_language,provider,model));
+        CREATE TABLE IF NOT EXISTS sentence_translations(episode_id INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,content_key TEXT NOT NULL,target_language TEXT NOT NULL,provider TEXT NOT NULL,model TEXT NOT NULL,translation TEXT NOT NULL,created_at TEXT NOT NULL,expressions_json TEXT,PRIMARY KEY(episode_id,content_key,target_language,provider,model));
         CREATE TABLE IF NOT EXISTS translation_prefetch_jobs(episode_id INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,content_key TEXT NOT NULL,model TEXT NOT NULL,segment_index INTEGER NOT NULL,source_fingerprint TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('pending','running','ready','error','stale')),error TEXT NOT NULL DEFAULT '',updated_at TEXT NOT NULL,PRIMARY KEY(episode_id,content_key,model));
         CREATE TABLE IF NOT EXISTS translation_prefetch_control(id INTEGER PRIMARY KEY CHECK(id=1),paused INTEGER NOT NULL DEFAULT 0,error TEXT NOT NULL DEFAULT '',updated_at TEXT NOT NULL);
         INSERT OR IGNORE INTO translation_prefetch_control(id,paused,error,updated_at) VALUES(1,0,'','');
         """)
+        translation_columns = {r[1] for r in c.execute("PRAGMA table_info(sentence_translations)")}
+        if "expressions_json" not in translation_columns:
+            # NULL means a legacy translation has not been enriched yet; "[]" is a completed analysis with no notable phrases.
+            c.execute("ALTER TABLE sentence_translations ADD COLUMN expressions_json TEXT")
         # Additive migrations preserve existing local feeds, episodes, and transcripts.
         feed_columns = {r[1] for r in c.execute("PRAGMA table_info(feeds)")}
         if "auto_since" not in feed_columns:
@@ -599,10 +603,10 @@ def enqueue_episode_translation_prefetch(episode_id: int, *, resume_paused: bool
             content_key = _translation_content_key(fingerprint, model)
             active_keys.append(content_key)
             cached = c.execute(
-                "SELECT 1 FROM sentence_translations WHERE episode_id=? AND content_key=? AND target_language='ja' AND provider='agy' AND model=?",
+                "SELECT expressions_json FROM sentence_translations WHERE episode_id=? AND content_key=? AND target_language='ja' AND provider='agy' AND model=?",
                 (episode_id, content_key, model),
             ).fetchone()
-            status = "ready" if cached else "pending"
+            status = "ready" if cached is not None and cached["expressions_json"] is not None else "pending"
             prepared.append((index, content_key, fingerprint, status, model))
         active_key_set = set(active_keys)
         old_jobs = c.execute("SELECT content_key FROM translation_prefetch_jobs WHERE episode_id=? AND model=? AND status IN ('pending','running')",
@@ -616,8 +620,8 @@ def enqueue_episode_translation_prefetch(episode_id: int, *, resume_paused: bool
                 "INSERT INTO translation_prefetch_jobs(episode_id,content_key,model,segment_index,source_fingerprint,status,error,updated_at) "
                 "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(episode_id,content_key,model) DO UPDATE SET "
                 "segment_index=excluded.segment_index,source_fingerprint=excluded.source_fingerprint,"
-                "status=CASE WHEN excluded.status='ready' THEN 'ready' WHEN translation_prefetch_jobs.status='stale' THEN 'pending' ELSE translation_prefetch_jobs.status END,"
-                "error=CASE WHEN excluded.status='ready' OR translation_prefetch_jobs.status='stale' THEN '' ELSE translation_prefetch_jobs.error END,updated_at=excluded.updated_at",
+                "status=CASE WHEN excluded.status='ready' THEN 'ready' WHEN translation_prefetch_jobs.status IN ('stale','ready') THEN 'pending' ELSE translation_prefetch_jobs.status END,"
+                "error=CASE WHEN excluded.status='ready' OR translation_prefetch_jobs.status IN ('stale','ready') THEN '' ELSE translation_prefetch_jobs.error END,updated_at=excluded.updated_at",
                 (episode_id, content_key, selected_model, index, fingerprint, status, "", now),
             )
             added += 1
@@ -770,10 +774,10 @@ def _prefetch_batch(items: list[sqlite3.Row], stop: threading.Event | None = Non
         for item, sentence in candidates:
             with db() as c:
                 cached = c.execute(
-                    "SELECT translation FROM sentence_translations WHERE episode_id=? AND content_key=? AND target_language='ja' AND provider='agy' AND model=?",
+                    "SELECT translation,expressions_json FROM sentence_translations WHERE episode_id=? AND content_key=? AND target_language='ja' AND provider='agy' AND model=?",
                     (episode_id, item["content_key"], item["model"]),
                 ).fetchone()
-            if cached:
+            if cached is not None and cached["expressions_json"] is not None:
                 _finish_prefetch_items([item], "ready", "")
             elif _current_segment_fingerprint(episode_id, item["segment_index"]) != item["source_fingerprint"]:
                 _finish_prefetch_items([item], "stale", "Transcript sentence changed.")
@@ -794,7 +798,7 @@ def _prefetch_batch(items: list[sqlite3.Row], stop: threading.Event | None = Non
                     _finish_prefetch_items(stale_missing, "stale", "Transcript sentence changed.")
                 if not current_missing:
                     return
-                translations = translate_sentences([sentence for _, sentence in current_missing], model=items[0]["model"])
+                results = translate_sentences_with_expressions([sentence for _, sentence in current_missing], model=items[0]["model"])
         except TranslationRunnerError as exc:
             # A batch fails closed and is not automatically retried. A later tap
             # can still translate an individual sentence through the normal API.
@@ -803,19 +807,23 @@ def _prefetch_batch(items: list[sqlite3.Row], stop: threading.Event | None = Non
                                                 "Translation could not be completed."} else "Translation could not be completed."
             _finish_prefetch_items([item for item, _ in current_missing], "error", message)
             return
-        if len(translations) != len(current_missing):
+        if len(results) != len(current_missing):
             _finish_prefetch_items([item for item, _ in current_missing], "error", "Translation could not be completed.")
             return
         now = datetime.now(timezone.utc).isoformat()
         with db() as c:
-            for (item, _), translated in zip(current_missing, translations):
+            for (item, _), result in zip(current_missing, results):
                 current = _current_segment_fingerprint(episode_id, item["segment_index"])
                 if current != item["source_fingerprint"]:
                     c.execute("UPDATE translation_prefetch_jobs SET status='stale',error='Transcript sentence changed.',updated_at=? WHERE episode_id=? AND content_key=? AND model=? AND status='running'",
                               (now, episode_id, item["content_key"], item["model"]))
                     continue
-                c.execute("INSERT OR IGNORE INTO sentence_translations(episode_id,content_key,target_language,provider,model,translation,created_at) VALUES(?,?,'ja','agy',?,?,?)",
-                          (episode_id, item["content_key"], item["model"], translated, now))
+                expressions_json = json.dumps(result["expressions"], ensure_ascii=False, separators=(",", ":"))
+                c.execute("INSERT OR IGNORE INTO sentence_translations(episode_id,content_key,target_language,provider,model,translation,created_at,expressions_json) VALUES(?,?,'ja','agy',?,?,?,?)",
+                          (episode_id, item["content_key"], item["model"], result["translation"], now, expressions_json))
+                # Keep a translation generated before this feature unchanged while filling its missing notes.
+                c.execute("UPDATE sentence_translations SET expressions_json=COALESCE(expressions_json,?) WHERE episode_id=? AND content_key=? AND target_language='ja' AND provider='agy' AND model=?",
+                          (expressions_json, episode_id, item["content_key"], item["model"]))
                 c.execute("UPDATE translation_prefetch_jobs SET status='ready',error='',updated_at=? WHERE episode_id=? AND content_key=? AND model=?",
                           (now, episode_id, item["content_key"], item["model"]))
     finally:
@@ -970,12 +978,13 @@ def translate_episode_segment(episode_id: int, segment_index: int, payload: Tran
     content_key = _translation_content_key(source_fingerprint, model)
     def cached_translation() -> sqlite3.Row | None:
         with db() as c:
-            return c.execute("SELECT translation FROM sentence_translations WHERE episode_id=? AND content_key=? AND target_language='ja' AND provider=? AND model=?",
+            return c.execute("SELECT translation,expressions_json FROM sentence_translations WHERE episode_id=? AND content_key=? AND target_language='ja' AND provider=? AND model=?",
                              (episode_id, content_key, provider, model)).fetchone()
     cached = cached_translation()
-    if cached is not None:
+    if cached is not None and cached["expressions_json"] is not None:
         _mark_translation_prefetch_ready(episode_id, content_key, model)
-        return {"translation": cached["translation"], "cached": True, "target_language": "ja", "source_fingerprint": source_fingerprint}
+        return {"translation": cached["translation"], "expressions": json.loads(cached["expressions_json"]),
+                "expressions_ready": True, "cached": True, "target_language": "ja", "source_fingerprint": source_fingerprint}
 
     lock_key = (episode_id, content_key)
     lock = _acquire_sentence_translation_lock(lock_key)
@@ -985,15 +994,22 @@ def translate_episode_segment(episode_id: int, segment_index: int, payload: Tran
         if _current_segment_fingerprint(episode_id, segment_index) != source_fingerprint:
             raise HTTPException(409, "Transcript sentence changed. Refresh the transcript and try again.")
         cached = cached_translation()
-        if cached is not None:
+        if cached is not None and cached["expressions_json"] is not None:
             _mark_translation_prefetch_ready(episode_id, content_key, model)
-            return {"translation": cached["translation"], "cached": True, "target_language": "ja", "source_fingerprint": source_fingerprint}
+            return {"translation": cached["translation"], "expressions": json.loads(cached["expressions_json"]),
+                    "expressions_ready": True, "cached": True, "target_language": "ja", "source_fingerprint": source_fingerprint}
         try:
             with _agy_request_lock:
                 if _current_segment_fingerprint(episode_id, segment_index) != source_fingerprint:
                     raise HTTPException(409, "Transcript sentence changed. Refresh the transcript and try again.")
-                translated = translate_sentence(sentence, model=model)
+                generated = translate_sentence_with_expressions(sentence, model=model)
         except TranslationRunnerError as error:
+            if cached is not None:
+                if _current_segment_fingerprint(episode_id, segment_index) != source_fingerprint:
+                    raise HTTPException(409, "Transcript sentence changed. Refresh the transcript and try again.") from None
+                return {"translation": cached["translation"], "expressions": [], "expressions_ready": False,
+                        "explanation_error": str(error), "cached": True, "target_language": "ja",
+                        "source_fingerprint": source_fingerprint}
             message = str(error)
             if message == "Translation timed out. Please try again.":
                 raise HTTPException(504, message) from None
@@ -1001,17 +1017,22 @@ def translate_episode_segment(episode_id: int, segment_index: int, payload: Tran
             raise HTTPException(status, message) from None
         if _current_segment_fingerprint(episode_id, segment_index) != source_fingerprint:
             raise HTTPException(409, "Transcript sentence changed. Refresh the transcript and try again.")
+        expressions_json = json.dumps(generated["expressions"], ensure_ascii=False, separators=(",", ":"))
         with db() as c:
-            c.execute("INSERT OR IGNORE INTO sentence_translations(episode_id,content_key,target_language,provider,model,translation,created_at) VALUES(?,?,'ja',?,?,?,?)",
-                      (episode_id, content_key, provider, model, translated, datetime.now(timezone.utc).isoformat()))
+            c.execute("INSERT OR IGNORE INTO sentence_translations(episode_id,content_key,target_language,provider,model,translation,created_at,expressions_json) VALUES(?,?,'ja',?,?,?,?,?)",
+                      (episode_id, content_key, provider, model, generated["translation"], datetime.now(timezone.utc).isoformat(), expressions_json))
+            c.execute("UPDATE sentence_translations SET expressions_json=COALESCE(expressions_json,?) WHERE episode_id=? AND content_key=? AND target_language='ja' AND provider=? AND model=?",
+                      (expressions_json, episode_id, content_key, provider, model))
             c.execute("UPDATE translation_prefetch_jobs SET status='ready',error='',updated_at=? WHERE episode_id=? AND content_key=? AND model=?",
                       (datetime.now(timezone.utc).isoformat(), episode_id, content_key, model))
-            stored = c.execute("SELECT translation FROM sentence_translations WHERE episode_id=? AND content_key=? AND target_language='ja' AND provider=? AND model=?",
+            stored = c.execute("SELECT translation,expressions_json FROM sentence_translations WHERE episode_id=? AND content_key=? AND target_language='ja' AND provider=? AND model=?",
                                 (episode_id, content_key, provider, model)).fetchone()
             c.execute("UPDATE translation_prefetch_control SET paused=0,error='',updated_at=? WHERE id=1",
                       (datetime.now(timezone.utc).isoformat(),))
         wake_translation_prefetch_worker()
-        return {"translation": stored["translation"], "cached": False, "target_language": "ja", "source_fingerprint": source_fingerprint}
+        return {"translation": stored["translation"], "expressions": json.loads(stored["expressions_json"]),
+                "expressions_ready": True, "cached": cached is not None, "target_language": "ja",
+                "source_fingerprint": source_fingerprint}
     finally:
         _release_sentence_translation_lock(lock_key, lock)
 

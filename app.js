@@ -78,6 +78,16 @@ function transcriptData(data) {
   return { status: data.status || root.status || 'ready', error: data.error || root.error || '', segments: root.segments || data.segments || [] };
 }
 
+function safeExpressionNotes(value, sentence) {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item) => item && typeof item === 'object'
+      && typeof item.phrase === 'string' && typeof item.explanation === 'string'
+      && item.phrase.trim() && item.phrase.length <= 80 && item.explanation.trim() && item.explanation.length <= 180
+      && (typeof sentence !== 'string' || sentence.includes(item.phrase.trim())))
+    .slice(0, 2)
+    .map((item) => ({ phrase: item.phrase.trim(), explanation: item.explanation.trim() }));
+}
+
 function translationStorageKey() { return `linguacast-translations-${idOf(state.episode)}`; }
 function loadEpisodeTranslations(episodeId) {
   state.translations = {};
@@ -87,7 +97,14 @@ function loadEpisodeTranslations(episodeId) {
     if (saved && typeof saved === 'object' && !Array.isArray(saved)) {
       state.translations = Object.fromEntries(Object.entries(saved)
         .filter(([, entry]) => entry && /^[a-f0-9]{64}$/.test(entry.source_fingerprint || '') && typeof entry.translation === 'string')
-        .map(([index, entry]) => [index, { source_fingerprint: entry.source_fingerprint, translation: entry.translation, expanded: false }]));
+        .map(([index, entry]) => [index, {
+          source_fingerprint: entry.source_fingerprint,
+          translation: entry.translation,
+          expressions: safeExpressionNotes(entry.expressions, state.segments[Number(index)]?.text),
+          expressions_ready: entry.expressions_ready === true ? true : undefined,
+          explanation_error: typeof entry.explanation_error === 'string' ? entry.explanation_error : '',
+          expanded: false,
+        }]));
     }
   } catch { /* Translation cache is optional. */ }
 }
@@ -109,15 +126,32 @@ function updateTranslationUI(index) {
   const entry = translationEntry(index);
   const loading = state.translationRequests.has(translationRequestKey(index));
   button.disabled = loading;
-  button.textContent = loading ? 'Translating…' : entry?.refreshRequired ? 'Refresh transcript' : entry?.error ? 'Retry translation' : entry?.translation ? (entry.expanded ? 'Hide Japanese' : 'Show Japanese') : 'Show Japanese';
+  button.textContent = loading ? (entry?.translation ? 'Adding notes…' : 'Translating…')
+    : entry?.refreshRequired ? 'Refresh transcript' : entry?.error ? 'Retry translation'
+      : entry?.translation ? (entry.expanded ? 'Hide Japanese' : 'Show Japanese') : 'Show Japanese';
   button.setAttribute('aria-expanded', String(Boolean(entry?.expanded || loading)));
   panel.hidden = !(entry?.expanded || loading);
   panel.setAttribute('aria-busy', String(loading));
-  if (loading) { panel.textContent = 'Translating…'; panel.classList.add('translation-loading'); }
-  else {
-    panel.classList.remove('translation-loading');
-    panel.textContent = entry?.translation || entry?.error || '';
+  const translationText = panel.querySelector('.translation-ja');
+  const notes = panel.querySelector('.expression-notes');
+  const retryButton = panel.querySelector('.expression-retry');
+  translationText.textContent = loading && !entry?.translation ? 'Translating…' : entry?.translation || entry?.error || '';
+  const expressions = safeExpressionNotes(entry?.expressions, state.segments[index]?.text);
+  notes.replaceChildren();
+  if (expressions.length) {
+    notes.innerHTML = expressions.map(({ phrase, explanation }) =>
+      `<div class="expression-note"><strong>${escapeHTML(phrase)}</strong><span>${escapeHTML(explanation)}</span></div>`
+    ).join('');
+    notes.hidden = false;
+  } else if (entry?.translation && entry.expressions_ready !== true) {
+    notes.textContent = loading ? 'Finding useful expressions…'
+      : entry?.explanation_error || 'Expression notes are not ready.';
+    notes.hidden = false;
+  } else {
+    notes.hidden = true;
   }
+  retryButton.hidden = !(entry?.translation && entry.expressions_ready !== true && entry.explanation_error && !loading);
+  panel.classList.toggle('translation-loading', loading);
   panel.classList.toggle('translation-error', Boolean(entry?.error));
 }
 
@@ -152,18 +186,24 @@ function startTranslationPrefetchProgress(episodeId, requestId) {
 }
 async function toggleTranslation(index) {
   if (!state.episode || !state.segments[index]) return;
-  const episodeId = idOf(state.episode);
-  const requestKey = translationRequestKey(index, episodeId);
-  if (state.translationRequests.has(requestKey)) return;
-  const sourceFingerprint = state.segments[index].source_fingerprint;
   const current = translationEntry(index);
   if (current?.refreshRequired) { await refreshTranscriptForTranslation(index); return; }
-  if (current?.translation) {
+  if (current?.translation && (current.expanded || current.expressions_ready === true || current.explanation_error)) {
     current.expanded = !current.expanded;
     updateTranslationUI(index);
     saveEpisodeTranslations();
     return;
   }
+  await requestTranslation(index);
+}
+
+async function requestTranslation(index) {
+  if (!state.episode || !state.segments[index]) return;
+  const episodeId = idOf(state.episode);
+  const requestKey = translationRequestKey(index, episodeId);
+  if (state.translationRequests.has(requestKey)) return;
+  const sourceFingerprint = state.segments[index].source_fingerprint;
+  const current = translationEntry(index);
   if (!/^[a-f0-9]{64}$/.test(sourceFingerprint || '')) {
     state.translations[index] = { error: 'This sentence cannot be verified yet. Refresh the transcript and try again.', expanded: true, refreshRequired: true };
     updateTranslationUI(index);
@@ -181,7 +221,14 @@ async function toggleTranslation(index) {
     if (result.source_fingerprint !== sourceFingerprint) throw new Error('This sentence changed while translating. Refresh the transcript and try again.');
     const translated = String(result.translation || '');
     if (!translated) throw new Error('No translation was returned. Try again.');
-    state.translations[index] = { source_fingerprint: sourceFingerprint, translation: translated, expanded: true };
+    state.translations[index] = {
+      source_fingerprint: sourceFingerprint,
+      translation: translated,
+      expressions: safeExpressionNotes(result.expressions, state.segments[index]?.text),
+      expressions_ready: result.expressions_ready === true,
+      explanation_error: result.explanation_error || '',
+      expanded: true,
+    };
     saveEpisodeTranslations();
     refreshTranslationPrefetchProgress(episodeId, requestId);
   } catch (error) {
@@ -190,7 +237,9 @@ async function toggleTranslation(index) {
     const message = refreshRequired
       ? 'This transcript sentence changed. Refresh the transcript before translating it.'
       : error.message || 'Translation failed. Try again.';
-    state.translations[index] = { source_fingerprint: sourceFingerprint, error: message, expanded: true, refreshRequired };
+    state.translations[index] = current?.translation
+      ? { ...current, explanation_error: message, refreshRequired, expanded: true }
+      : { source_fingerprint: sourceFingerprint, error: message, expanded: true, refreshRequired };
   } finally {
     state.translationRequests.delete(requestKey);
     if (requestId === state.episodeRequestId) updateTranslationUI(index);
@@ -326,8 +375,9 @@ function renderTranscript() {
     if (!words.length) wordsHTML = `<span class="word" data-line="${index}" data-word="0" data-start="${start}" data-end="${end}">${wordsHTML}</span>`;
     const cached = translationEntry(index);
     const translationHTML = cached?.translation ? escapeHTML(cached.translation) : cached?.error ? escapeHTML(cached.error) : '';
-    return `<article class="transcript-line" data-line="${index}" data-start="${start}" data-end="${end}"><div class="sentence-toolbar"><button type="button" class="line-time" data-play-line="${index}" aria-label="Play from ${fmtTime(start)}">${fmtTime(start)}</button><button type="button" class="translation-toggle" data-translation-line="${index}" aria-expanded="false" aria-controls="translation-${index}">Show Japanese</button><button class="line-loop" data-loop-line="${index}" aria-label="Repeat this sentence" aria-pressed="false">↻</button></div><div class="line-text">${wordsHTML}</div><div id="translation-${index}" class="translation-content" aria-live="polite" hidden>${translationHTML}</div></article>`;
+    return `<article class="transcript-line" data-line="${index}" data-start="${start}" data-end="${end}"><div class="sentence-toolbar"><button type="button" class="line-time" data-play-line="${index}" aria-label="Play from ${fmtTime(start)}">${fmtTime(start)}</button><button type="button" class="translation-toggle" data-translation-line="${index}" aria-expanded="false" aria-controls="translation-${index}">Show Japanese</button><button class="line-loop" data-loop-line="${index}" aria-label="Repeat this sentence" aria-pressed="false">↻</button></div><div class="line-text">${wordsHTML}</div><div id="translation-${index}" class="translation-content" aria-live="polite" hidden><div class="translation-ja">${translationHTML}</div><div class="expression-notes" hidden></div><button type="button" class="expression-retry" data-translation-retry="${index}" hidden>Retry expression notes</button></div></article>`;
   }).join('');
+  state.segments.forEach((_, index) => updateTranslationUI(index));
 }
 
 async function startTranscription() {
@@ -540,6 +590,8 @@ $('#player-back').addEventListener('click', () => { state.episodeRequestId += 1;
 $('#transcribe-button').addEventListener('click', startTranscription);
 $('#follow-playback').addEventListener('click', () => setPlaybackFollow(true));
 $('#transcript-lines').addEventListener('click', (event) => {
+  const retry = event.target.closest('[data-translation-retry]');
+  if (retry) { event.preventDefault(); event.stopPropagation(); requestTranslation(Number(retry.dataset.translationRetry)); return; }
   const translation = event.target.closest('[data-translation-line]');
   if (translation) { event.preventDefault(); event.stopPropagation(); toggleTranslation(Number(translation.dataset.translationLine)); return; }
   const seekLine = event.target.closest('[data-play-line]');
