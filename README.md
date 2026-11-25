@@ -70,18 +70,13 @@ WHISPER_MODEL=base.en uvicorn app:app --host 127.0.0.1 --port 8000
 
 ## Optional Japanese sentence translations
 
-When a transcript is ready, tap **Show Japanese** under a sentence to request its Japanese translation. Translations are hidden by default. The first request for a sentence is sent to Google's Gemini API using `gemini-4-hydrogen`; later requests for the same transcript sentence use LinguaCast's local cache. Cached translations are hidden again when the episode is reopened. If the transcript sentence changes, its old translation is not reused. If the feature is not configured, LinguaCast displays an informational message. Provider failures are shown as generic retry guidance; API keys and raw provider error responses are not sent to the browser.
+When a transcript is ready, tap **Show Japanese** under a sentence to request its translation. Translations are hidden by default. LinguaCast invokes the local `agy` command-line client on demand, using the `gemini-4-hydrogen-medium` model by default. You can select another model available to your account with `AGY_TRANSLATION_MODEL`. The first request for a sentence is sent to Google through Antigravity; LinguaCast caches the result locally, so showing the same sentence again does not require another provider request. A changed sentence gets a new translation. Provider failures are shown as generic retry guidance.
 
-To enable translations, create a Gemini API key in [Google AI Studio](https://aistudio.google.com/app/apikey), then set it in the environment used to start the LinguaCast server:
+To use translations, install and sign in to `agy` on the machine running LinguaCast. The CLI login must be available to the same operating-system user that runs the LinguaCast server (including when the server is started as a background service). Translation uses that Google account through Antigravity; it does not require a Gemini API key. The selected model must be available to the signed-in account. Account access, quotas, and other usage limits are determined by Antigravity and may change. CLI startup and provider response time can add noticeable, variable delay the first time a sentence is translated.
 
-```sh
-export GEMINI_API_KEY="your-api-key"
-uvicorn app:app --host 127.0.0.1 --port 8000
-```
+**Privacy:** Translation is on demand. When you tap a sentence for the first time, only that transcript sentence is sent to Google through `agy`; LinguaCast does not send the episode audio or the full transcript for the translation request. The sentence and its translation are cached on the LinguaCast server. Do not use this feature for text you do not want to send to Google. Speech recognition remains local and uses faster-whisper; it does not use `agy` or send audio to Google. Playback and local transcription do not require an `agy` login.
 
-Keep the key on the server: do not put it in browser code, commit it, or share it. Set it through your environment or a secret manager before starting the app. The app does not need a Gemini API key for local speech transcription or podcast playback.
-
-**Privacy and cost:** Translation is on demand. When you tap a sentence for the first time, LinguaCast sends that transcript sentence to Google's Gemini API over the internet for translation. It does not send the episode audio or the entire transcript for this request. The sentence and returned translation are cached on the LinguaCast server; the browser also keeps a local copy so it can stay hidden and be shown again without another API request. Do not use this feature for text you do not want to send to Google. Google's Gemini API [pricing and data-use terms](https://ai.google.dev/gemini-api/docs/pricing) can change: the free tier has usage limits and may use submitted content to improve Google products, while paid API usage is billed by token and is not used for product improvement under the current terms. Check the current pricing and terms before use. A Gemini app or Google AI plan subscription is separate from Gemini API access and does not pay for this app's API requests; API usage is associated with the Google AI Studio project and its billing settings. See Google's [API setup guide](https://ai.google.dev/gemini-api/docs/get-started) for key and billing details.
+The `agy` integration includes offline, mocked tests. An authenticated synthetic translation was also verified in a systemd user service; account availability and quotas depend on your own environment.
 
 ## Data and limitations
 
