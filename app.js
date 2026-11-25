@@ -1,5 +1,5 @@
 const $ = (selector) => document.querySelector(selector);
-const state = { feeds: [], episodes: [], feedId: null, episode: null, segments: [], translations: {}, translationRequests: new Set(), activeLine: -1, loopLine: -1, speeds: [0.5, 0.75, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2], speedIndex: 3, pollTimer: null, toastTimer: null, followPlayback: true, touchStartY: null, touchStartTarget: null, seekDragging: false, lastPositionSaveAt: 0, lastSavedPosition: 0, lastMediaPositionAt: 0, switchingEpisode: false, episodeRequestId: 0, episodeLoading: false, positionReady: false, metadataRestoreHandler: null, metadataErrorHandler: null };
+const state = { feeds: [], episodes: [], feedId: null, episode: null, segments: [], translations: {}, translationRequests: new Set(), activeLine: -1, loopLine: -1, speeds: [0.5, 0.75, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2], speedIndex: 3, pollTimer: null, translationPrefetchTimer: null, toastTimer: null, followPlayback: true, touchStartY: null, touchStartTarget: null, seekDragging: false, lastPositionSaveAt: 0, lastSavedPosition: 0, lastMediaPositionAt: 0, switchingEpisode: false, episodeRequestId: 0, episodeLoading: false, positionReady: false, metadataRestoreHandler: null, metadataErrorHandler: null };
 const audio = $('#audio');
 try {
   const savedRate = Number(localStorage.getItem('linguacast-playback-rate'));
@@ -120,6 +120,36 @@ function updateTranslationUI(index) {
   }
   panel.classList.toggle('translation-error', Boolean(entry?.error));
 }
+
+function renderTranslationPrefetchStatus(progress) {
+  const badge = $('#translation-prefetch-status');
+  if (!badge) return;
+  if (!progress || progress.status === 'not_started') { badge.hidden = true; return; }
+  badge.hidden = false;
+  if (progress.status === 'preparing') badge.textContent = `Preparing Japanese translations · ${progress.ready} of ${progress.total}`;
+  else if (progress.status === 'paused') badge.textContent = `Translations paused · ${progress.ready} of ${progress.total} ready; tap a sentence to translate`;
+  else if (progress.status === 'partial') badge.textContent = `Some translations need retry · ${progress.ready} of ${progress.total} ready`;
+  else badge.textContent = 'Japanese translations ready';
+}
+
+async function refreshTranslationPrefetchProgress(episodeId, requestId) {
+  try {
+    const progress = await api(`/api/episodes/${encodeURIComponent(episodeId)}/translation-progress`);
+    if (requestId !== state.episodeRequestId || String(idOf(state.episode)) !== String(episodeId)) return;
+    renderTranslationPrefetchStatus(progress);
+    if (progress.status === 'ready' || progress.status === 'partial' || progress.status === 'paused' || progress.status === 'not_started') {
+      clearInterval(state.translationPrefetchTimer);
+      state.translationPrefetchTimer = null;
+    }
+  } catch { /* Progress is informational; sentence playback and translation remain available. */ }
+}
+
+function startTranslationPrefetchProgress(episodeId, requestId) {
+  clearInterval(state.translationPrefetchTimer);
+  state.translationPrefetchTimer = null;
+  refreshTranslationPrefetchProgress(episodeId, requestId);
+  state.translationPrefetchTimer = setInterval(() => refreshTranslationPrefetchProgress(episodeId, requestId), 5000);
+}
 async function toggleTranslation(index) {
   if (!state.episode || !state.segments[index]) return;
   const episodeId = idOf(state.episode);
@@ -153,6 +183,7 @@ async function toggleTranslation(index) {
     if (!translated) throw new Error('No translation was returned. Try again.');
     state.translations[index] = { source_fingerprint: sourceFingerprint, translation: translated, expanded: true };
     saveEpisodeTranslations();
+    refreshTranslationPrefetchProgress(episodeId, requestId);
   } catch (error) {
     if (requestId !== state.episodeRequestId) return;
     const refreshRequired = error.status === 409;
@@ -210,6 +241,8 @@ async function openEpisode(episodeId) {
   state.episodeLoading = true;
   $('#transcribe-button').disabled = true;
   clearInterval(state.pollTimer); state.pollTimer = null;
+  clearInterval(state.translationPrefetchTimer); state.translationPrefetchTimer = null;
+  renderTranslationPrefetchStatus(null);
   try {
     const episode = await api(`/api/episodes/${encodeURIComponent(episodeId)}`);
     if (requestId !== state.episodeRequestId) return;
@@ -257,7 +290,7 @@ async function openEpisode(episodeId) {
     const result = await api(`/api/episodes/${encodeURIComponent(episodeId)}/transcript`).catch(() => ({}));
     if (requestId !== state.episodeRequestId) return;
     const transcript = transcriptData(result);
-    if (transcript.segments.length) { state.segments = transcript.segments; renderTranscript(); setTranscriptStatus('ready'); }
+    if (transcript.segments.length) { state.segments = transcript.segments; renderTranscript(); setTranscriptStatus('ready'); startTranslationPrefetchProgress(episodeId, requestId); }
     else if (['processing', 'queued', 'downloading'].includes(transcript.status)) { state.segments = []; renderTranscript(); setTranscriptStatus('pending'); pollTranscript(episodeId, requestId); }
     else if (transcript.status === 'error') { state.segments = []; renderTranscript(); setTranscriptStatus('error', transcript.error); }
     else { state.segments = []; renderTranscript(); setTranscriptStatus('missing'); }
@@ -333,7 +366,7 @@ function pollTranscript(episodeId, requestId = state.episodeRequestId) {
       if (requestId !== state.episodeRequestId) { clearInterval(timer); return; }
       statusCheckWarningShown = false;
       const transcript = transcriptData(result);
-      if (transcript.segments.length) { clearInterval(timer); if (state.pollTimer === timer) state.pollTimer = null; state.segments = transcript.segments; renderTranscript(); setTranscriptStatus('ready'); showToast('Transcript ready'); }
+      if (transcript.segments.length) { clearInterval(timer); if (state.pollTimer === timer) state.pollTimer = null; state.segments = transcript.segments; renderTranscript(); setTranscriptStatus('ready'); startTranslationPrefetchProgress(episodeId, requestId); showToast('Transcript ready'); }
       else if (transcript.status === 'error' || transcript.status === 'failed') { clearInterval(timer); if (state.pollTimer === timer) state.pollTimer = null; setTranscriptStatus('error', transcript.error || 'Transcription failed.'); }
       else if (!['queued', 'downloading', 'processing'].includes(transcript.status)) { clearInterval(timer); if (state.pollTimer === timer) state.pollTimer = null; setTranscriptStatus('error', 'Transcription is no longer active. You can try again.'); }
     } catch (error) {
@@ -503,7 +536,7 @@ $('#add-feed-form').addEventListener('submit', async (event) => {
 $('#feed-list').addEventListener('click', (event) => { const card = event.target.closest('[data-feed-id]'); if (card) openFeed(card.dataset.feedId); });
 $('#episode-list').addEventListener('click', (event) => { const button = event.target.closest('[data-episode-id]'); if (button) openEpisode(button.dataset.episodeId); });
 $('#back-to-shows').addEventListener('click', () => { $('#episode-section').hidden = true; window.scrollTo({ top: 0, behavior: 'smooth' }); });
-$('#player-back').addEventListener('click', () => { state.episodeRequestId += 1; state.episodeLoading = false; $('#transcribe-button').disabled = false; clearInterval(state.pollTimer); state.pollTimer = null; audio.pause(); $('#player-view').hidden = true; $('#home-view').hidden = false; });
+$('#player-back').addEventListener('click', () => { state.episodeRequestId += 1; state.episodeLoading = false; $('#transcribe-button').disabled = false; clearInterval(state.pollTimer); state.pollTimer = null; clearInterval(state.translationPrefetchTimer); state.translationPrefetchTimer = null; audio.pause(); $('#player-view').hidden = true; $('#home-view').hidden = false; });
 $('#transcribe-button').addEventListener('click', startTranscription);
 $('#follow-playback').addEventListener('click', () => setPlaybackFollow(true));
 $('#transcript-lines').addEventListener('click', (event) => {

@@ -47,12 +47,15 @@ class TranslationEndpointTest(unittest.TestCase):
         self.client = TestClient(backend.app)
         self.old_lock_guard = backend._translation_lock_guard
         self.old_locks = backend._translation_locks
+        self.old_agy_request_lock = backend._agy_request_lock
         backend._translation_lock_guard = threading.Lock()
         backend._translation_locks = {}
+        backend._agy_request_lock = threading.Lock()
 
     def tearDown(self) -> None:
         backend._translation_lock_guard = self.old_lock_guard
         backend._translation_locks = self.old_locks
+        backend._agy_request_lock = self.old_agy_request_lock
         backend.AGY_TRANSLATION_MODEL = self.old_model
         self.client.close()
         backend.DB_PATH = self.old_db_path
@@ -169,6 +172,153 @@ class TranslationEndpointTest(unittest.TestCase):
         ])
         provider.assert_called_once()
         self.assertEqual(len(self.rows()), 1)
+
+    def test_opening_existing_ready_transcript_enqueues_durable_batched_work(self) -> None:
+        with patch.object(backend, "translate_sentences") as provider:
+            response = self.client.get(f"/api/episodes/{self.episode_id}/transcript")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(backend.translation_prefetch_progress(self.episode_id), {
+            "status": "preparing", "total": 2, "ready": 0, "pending": 2,
+            "running": 0, "errors": 0, "stale": 0,
+        })
+        provider.assert_not_called()
+        with backend.db() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM translation_prefetch_jobs WHERE status='pending'").fetchone()[0], 2)
+
+    def test_new_ready_transcript_enqueues_prefetch_and_batch_results_are_cached(self) -> None:
+        transcript = json.loads(backend.get_episode(self.episode_id)["transcript_json"])
+        with patch.object(backend, "translate_sentences", return_value=["一つ目。", "二つ目。"]) as provider:
+            backend.set_state(self.episode_id, "ready", transcript=transcript)
+            with backend.db() as conn:
+                batch = conn.execute("SELECT * FROM translation_prefetch_jobs WHERE status='pending' ORDER BY segment_index").fetchall()
+            backend._prefetch_batch(batch)
+
+        provider.assert_called_once_with(["A synthetic sentence.", "Another synthetic sentence."], model="gemini-4-hydrogen-medium")
+        self.assertEqual(backend.translation_prefetch_progress(self.episode_id)["status"], "ready")
+        self.assertEqual(len(self.rows()), 2)
+        with patch.object(backend, "translate_sentence") as individual:
+            response = self.post_translation(0)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["translation"], "一つ目。")
+        self.assertTrue(response.json()["cached"])
+        individual.assert_not_called()
+
+    def test_failed_batch_is_terminal_until_explicit_episode_open_resumes_queue(self) -> None:
+        self.client.get(f"/api/episodes/{self.episode_id}/transcript")
+        with backend.db() as conn:
+            batch = conn.execute("SELECT * FROM translation_prefetch_jobs WHERE status='pending' ORDER BY segment_index").fetchall()
+            conn.execute("UPDATE translation_prefetch_jobs SET status='running'")
+        stop = threading.Event()
+        wake = threading.Event()
+        with patch.object(backend, "translate_sentences", side_effect=backend.TranslationRunnerError("Translation is unavailable.")):
+            original = backend._prefetch_batch
+            def fail_then_stop(items, stop=None):
+                with backend.db() as conn:
+                    conn.execute("UPDATE translation_prefetch_jobs SET status='running'")
+                original(items)
+                stop.set()
+            with patch.object(backend, "_next_prefetch_batch", return_value=batch), patch.object(backend, "_prefetch_batch", side_effect=fail_then_stop):
+                backend._translation_prefetch_loop(stop, wake)
+        self.assertEqual(backend.translation_prefetch_progress(self.episode_id)["status"], "paused")
+        self.client.get(f"/api/episodes/{self.episode_id}/transcript")
+        with backend.db() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM translation_prefetch_jobs WHERE status='error'").fetchone()[0], 2)
+            self.assertEqual(conn.execute("SELECT paused FROM translation_prefetch_control WHERE id=1").fetchone()[0], 0)
+
+    def test_changed_transcript_marks_old_pending_prefetch_rows_stale(self) -> None:
+        self.client.get(f"/api/episodes/{self.episode_id}/transcript")
+        with backend.db() as conn:
+            old_keys = {row[0] for row in conn.execute("SELECT content_key FROM translation_prefetch_jobs WHERE status='pending'")}
+            transcript = json.loads(conn.execute("SELECT transcript_json FROM episodes WHERE id=?", (self.episode_id,)).fetchone()[0])
+            transcript["segments"][0]["text"] = "An edited synthetic sentence."
+            conn.execute("UPDATE episodes SET transcript_json=? WHERE id=?", (json.dumps(transcript), self.episode_id))
+        backend.enqueue_episode_translation_prefetch(self.episode_id)
+        with backend.db() as conn:
+            stale_keys = {row[0] for row in conn.execute("SELECT content_key FROM translation_prefetch_jobs WHERE status='stale'")}
+        self.assertEqual(stale_keys, old_keys - {backend._translation_content_key(
+            backend._segment_source_fingerprint(self.episode_id, transcript["segments"][1]), backend.AGY_TRANSLATION_MODEL
+        )})
+        self.assertEqual(backend.translation_prefetch_progress(self.episode_id)["total"], 2)
+
+    def test_prefetch_rechecks_transcript_after_waiting_for_provider_lock(self) -> None:
+        self.client.get(f"/api/episodes/{self.episode_id}/transcript")
+        with backend.db() as conn:
+            item = conn.execute("SELECT * FROM translation_prefetch_jobs WHERE segment_index=0").fetchone()
+            conn.execute("UPDATE translation_prefetch_jobs SET status='running' WHERE content_key=?", (item["content_key"],))
+        provider_lock = backend._agy_request_lock
+        provider_lock.acquire()
+        checked = threading.Event()
+        original_fingerprint = backend._current_segment_fingerprint
+        calls = 0
+        def signal_after_first_check(eid, index):
+            nonlocal calls
+            calls += 1
+            value = original_fingerprint(eid, index)
+            if calls == 1:
+                checked.set()
+            return value
+        with patch.object(backend, "_current_segment_fingerprint", side_effect=signal_after_first_check), \
+                patch.object(backend, "translate_sentences") as provider:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(backend._prefetch_batch, [item])
+                self.assertTrue(checked.wait(timeout=2))
+                with backend.db() as conn:
+                    transcript = json.loads(conn.execute("SELECT transcript_json FROM episodes WHERE id=?", (self.episode_id,)).fetchone()[0])
+                    transcript["segments"][0]["text"] = "Changed while waiting for the provider lock."
+                    conn.execute("UPDATE episodes SET transcript_json=? WHERE id=?", (json.dumps(transcript), self.episode_id))
+                provider_lock.release()
+                future.result(timeout=2)
+        provider.assert_not_called()
+        with backend.db() as conn:
+            status = conn.execute("SELECT status FROM translation_prefetch_jobs WHERE episode_id=? AND content_key=?",
+                                  (self.episode_id, item["content_key"])).fetchone()[0]
+        self.assertEqual(status, "stale")
+
+    def test_prefetch_stopped_while_waiting_for_provider_lock_restores_pending(self) -> None:
+        self.client.get(f"/api/episodes/{self.episode_id}/transcript")
+        with backend.db() as conn:
+            item = conn.execute("SELECT * FROM translation_prefetch_jobs WHERE segment_index=0").fetchone()
+            conn.execute("UPDATE translation_prefetch_jobs SET status='running' WHERE content_key=?", (item["content_key"],))
+        provider_lock = backend._agy_request_lock
+        provider_lock.acquire()
+        stop = threading.Event()
+        checked = threading.Event()
+        original_fingerprint = backend._current_segment_fingerprint
+        calls = 0
+        def signal_after_first_check(eid, index):
+            nonlocal calls
+            calls += 1
+            value = original_fingerprint(eid, index)
+            if calls == 1:
+                checked.set()
+            return value
+        with patch.object(backend, "_current_segment_fingerprint", side_effect=signal_after_first_check), \
+                patch.object(backend, "translate_sentences") as provider:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(backend._prefetch_batch, [item], stop)
+                self.assertTrue(checked.wait(timeout=2))
+                stop.set()
+                provider_lock.release()
+                future.result(timeout=2)
+        provider.assert_not_called()
+        with backend.db() as conn:
+            status = conn.execute("SELECT status FROM translation_prefetch_jobs WHERE episode_id=? AND content_key=?",
+                                  (self.episode_id, item["content_key"])).fetchone()[0]
+        self.assertEqual(status, "pending")
+
+    def test_prefetch_worker_start_is_idempotent(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        def hold_worker(stop, wake):
+            started.set()
+            release.wait(timeout=2)
+        with patch.object(backend, "_translation_prefetch_loop", side_effect=hold_worker) as worker:
+            backend.start_translation_prefetch_worker()
+            self.assertTrue(started.wait(timeout=2))
+            backend.start_translation_prefetch_worker()
+            self.assertEqual(worker.call_count, 1)
+            release.set()
+            backend.stop_translation_prefetch_worker()
 
 
 if __name__ == "__main__":

@@ -105,6 +105,8 @@ button:focus-visible,input:focus-visible,a:focus-visible{outline:3px solid #476f
 
 /* Sentence-level Japanese translation controls. */
 .translation-tools{margin:5px 0 0 52px;max-width:calc(100% - 52px)}
+.translation-prefetch-status{margin:0 0 10px;color:#65715f;font-size:12px;line-height:1.45}
+.translation-prefetch-status[hidden]{display:none}
 .translation-toggle{min-height:40px;padding:6px 8px;border:0;border-radius:7px;background:transparent;color:#526b43;font-size:14px;font-weight:700;text-align:left}
 .translation-toggle:hover:not(:disabled){background:#eef2e6}
 .translation-toggle:disabled{cursor:wait;color:#65715f}
