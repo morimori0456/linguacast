@@ -2,3 +2,24 @@
 data/
 __pycache__/
 *.pyc
+
+# Local settings, credentials, and authentication state
+.env
+.env.*
+!.env.example
+!.env.*.example
+.gemini/
+.config/antigravity/
+antigravity-oauth-token
+credentials.json
+credentials-*.json
+*.pem
+*.key
+
+# Local application databases and SQLite journal files
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
