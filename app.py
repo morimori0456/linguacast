@@ -13,6 +13,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, HttpUrl
+from translation_runner import DEFAULT_MODEL as DEFAULT_AGY_TRANSLATION_MODEL, TranslationRunnerError, translate_sentence
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("PODCAST_DATA_DIR", BASE_DIR / "data")).resolve()
@@ -31,7 +32,7 @@ _scheduler_stop: asyncio.Event | None = None
 _scheduler_task: asyncio.Task | None = None
 USER_AGENT = "PodcastReader/0.1 (personal RSS reader)"
 logger = logging.getLogger(__name__)
-GEMINI_MODEL = "gemini-4-hydrogen"
+AGY_TRANSLATION_MODEL = os.environ.get("AGY_TRANSLATION_MODEL", DEFAULT_AGY_TRANSLATION_MODEL).strip() or DEFAULT_AGY_TRANSLATION_MODEL
 _translation_lock_guard = threading.Lock()
 _translation_locks: dict[tuple[int, str], tuple[threading.Lock, int]] = {}
 
@@ -549,58 +550,6 @@ def _release_sentence_translation_lock(key: tuple[int, str], lock: threading.Loc
 class TranslationInput(BaseModel):
     expected_source_fingerprint: str
 
-def _gemini_translate_sentence(sentence: str, api_key: str) -> str:
-    """Translate one server-selected sentence; never expose provider errors or content."""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-    body = json.dumps({
-        "contents": [{"parts": [{"text": "Translate the following English sentence into natural Japanese for an English learner. Return only the Japanese translation, with no explanation or quotation marks.\n\n" + sentence}]}],
-        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1024},
-    }).encode("utf-8")
-    request = urllib.request.Request(url, data=body, headers={
-        "Content-Type": "application/json",
-        "x-goog-api-key": api_key,
-    }, method="POST")
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            raw = response.read(256 * 1024 + 1)
-        if len(raw) > 256 * 1024:
-            raise ValueError("oversized provider response")
-        payload = json.loads(raw.decode("utf-8"))
-        if not isinstance(payload, dict):
-            raise ValueError("invalid provider response")
-        candidates = payload.get("candidates")
-        if not isinstance(candidates, list) or len(candidates) != 1 or not isinstance(candidates[0], dict):
-            raise ValueError("invalid provider response")
-        candidate = candidates[0]
-        # MAX_TOKENS, SAFETY, and any unknown finish state can mean the result
-        # is partial or unsuitable; never persist or display it as a translation.
-        if candidate.get("finishReason") != "STOP":
-            raise ValueError("incomplete provider response")
-        content = candidate.get("content")
-        parts = content.get("parts") if isinstance(content, dict) else None
-        if not isinstance(parts, list) or not parts or any(not isinstance(part, dict) for part in parts):
-            raise ValueError("invalid provider response")
-        if any("text" in part and not isinstance(part["text"], str) for part in parts):
-            raise ValueError("invalid provider response")
-        translated = "".join(part.get("text", "") for part in parts).strip()
-        if not translated or len(translated) > 8000:
-            raise ValueError("invalid provider response")
-        return translated
-    except urllib.error.HTTPError as error:
-        # Do not read, log, or return the provider body; it may include request data.
-        if error.code == 429:
-            raise HTTPException(429, "Translation service quota or rate limit reached. Please try again later.") from None
-        if error.code in (401, 403):
-            raise HTTPException(503, "Translation service credentials are invalid or lack access. Contact the server administrator.") from None
-        if error.code in (500, 502, 503, 504):
-            raise HTTPException(503, "Translation service is temporarily unavailable. Please try again.") from None
-        raise HTTPException(502, "Translation service rejected the request. Please try again later.") from None
-    except (urllib.error.URLError, TimeoutError, ConnectionError):
-        raise HTTPException(503, "Translation service is temporarily unavailable. Please try again.") from None
-    except Exception:
-        # Malformed, blocked, or incomplete provider output is not cached or exposed.
-        raise HTTPException(502, "Translation service returned an incomplete or invalid response.") from None
-
 @app.post("/api/episodes/{episode_id}/translations/{segment_index}")
 def translate_episode_segment(episode_id: int, segment_index: int, payload: TranslationInput) -> dict[str, Any]:
     """Return a cached or newly generated Japanese translation for one transcript line."""
@@ -638,15 +587,16 @@ def translate_episode_segment(episode_id: int, segment_index: int, payload: Tran
     if not source_fingerprint or expected_fingerprint != source_fingerprint:
         raise HTTPException(409, "Transcript sentence changed. Refresh the transcript and try again.")
 
-    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    provider = "agy"
+    model = AGY_TRANSLATION_MODEL
     identity = json.dumps({"source_fingerprint": source_fingerprint,
-                           "target_language": "ja", "provider": "gemini", "model": GEMINI_MODEL},
+                           "target_language": "ja", "provider": provider, "model": model},
                           ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     content_key = hashlib.sha256(identity.encode("utf-8")).hexdigest()
     def cached_translation() -> sqlite3.Row | None:
         with db() as c:
-            return c.execute("SELECT translation FROM sentence_translations WHERE episode_id=? AND content_key=? AND target_language='ja' AND provider='gemini' AND model=?",
-                             (episode_id, content_key, GEMINI_MODEL)).fetchone()
+            return c.execute("SELECT translation FROM sentence_translations WHERE episode_id=? AND content_key=? AND target_language='ja' AND provider=? AND model=?",
+                             (episode_id, content_key, provider, model)).fetchone()
     cached = cached_translation()
     if cached is not None:
         return {"translation": cached["translation"], "cached": True, "target_language": "ja", "source_fingerprint": source_fingerprint}
@@ -661,16 +611,21 @@ def translate_episode_segment(episode_id: int, segment_index: int, payload: Tran
         cached = cached_translation()
         if cached is not None:
             return {"translation": cached["translation"], "cached": True, "target_language": "ja", "source_fingerprint": source_fingerprint}
-        if not api_key:
-            raise HTTPException(503, "Japanese translation is not configured on this server")
-        translated = _gemini_translate_sentence(sentence, api_key)
+        try:
+            translated = translate_sentence(sentence, model=model)
+        except TranslationRunnerError as error:
+            message = str(error)
+            if message == "Translation timed out. Please try again.":
+                raise HTTPException(504, message) from None
+            status = 502 if message == "Translation could not be completed." else 503
+            raise HTTPException(status, message) from None
         if _current_segment_fingerprint(episode_id, segment_index) != source_fingerprint:
             raise HTTPException(409, "Transcript sentence changed. Refresh the transcript and try again.")
         with db() as c:
-            c.execute("INSERT OR IGNORE INTO sentence_translations(episode_id,content_key,target_language,provider,model,translation,created_at) VALUES(?,?,'ja','gemini',?,?,?)",
-                      (episode_id, content_key, GEMINI_MODEL, translated, datetime.now(timezone.utc).isoformat()))
-            stored = c.execute("SELECT translation FROM sentence_translations WHERE episode_id=? AND content_key=? AND target_language='ja' AND provider='gemini' AND model=?",
-                                (episode_id, content_key, GEMINI_MODEL)).fetchone()
+            c.execute("INSERT OR IGNORE INTO sentence_translations(episode_id,content_key,target_language,provider,model,translation,created_at) VALUES(?,?,'ja',?,?,?,?)",
+                      (episode_id, content_key, provider, model, translated, datetime.now(timezone.utc).isoformat()))
+            stored = c.execute("SELECT translation FROM sentence_translations WHERE episode_id=? AND content_key=? AND target_language='ja' AND provider=? AND model=?",
+                                (episode_id, content_key, provider, model)).fetchone()
         return {"translation": stored["translation"], "cached": False, "target_language": "ja", "source_fingerprint": source_fingerprint}
     finally:
         _release_sentence_translation_lock(lock_key, lock)
