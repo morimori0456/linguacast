@@ -102,3 +102,18 @@ button:focus-visible,input:focus-visible,a:focus-visible{outline:3px solid #476f
 .line-time{min-width:44px;min-height:44px;display:inline-flex;align-items:center;justify-content:flex-start;padding:0 6px 0 0;border:0;background:transparent;color:#526055;font-family:'DM Mono',monospace;font-size:12px;text-align:left;vertical-align:middle;cursor:pointer}
 .follow-playback{min-height:44px;font-size:14px}
 .feed-sync-warning{display:block;margin-top:4px;color:#a14d3f;font-size:10px;font-weight:700;line-height:1.2}
+
+/* Sentence-level Japanese translation controls. */
+.translation-tools{margin:5px 0 0 52px;max-width:calc(100% - 52px)}
+.translation-toggle{min-height:40px;padding:6px 8px;border:0;border-radius:7px;background:transparent;color:#526b43;font-size:14px;font-weight:700;text-align:left}
+.translation-toggle:hover:not(:disabled){background:#eef2e6}
+.translation-toggle:disabled{cursor:wait;color:#65715f}
+.translation-content{margin:2px 8px 4px 8px;color:#4d5e50;font-size:15px;line-height:1.7;white-space:pre-wrap;overflow-wrap:anywhere}
+.translation-content[hidden]{display:none}
+.translation-content.translation-loading{color:#6c776b}
+.translation-content.translation-error{color:#a14d3f}
+@media(max-width:650px){
+ .translation-tools{margin-left:52px;max-width:calc(100% - 52px)}
+ .translation-toggle{min-height:44px;padding:7px 8px}
+ .translation-content{font-size:15px}
+}

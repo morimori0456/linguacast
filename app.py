@@ -31,6 +31,9 @@ _scheduler_stop: asyncio.Event | None = None
 _scheduler_task: asyncio.Task | None = None
 USER_AGENT = "PodcastReader/0.1 (personal RSS reader)"
 logger = logging.getLogger(__name__)
+GEMINI_MODEL = "gemini-4-hydrogen"
+_translation_lock_guard = threading.Lock()
+_translation_locks: dict[tuple[int, str], tuple[threading.Lock, int]] = {}
 
 def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=30)
@@ -43,6 +46,7 @@ def init_db() -> None:
         c.executescript("""
         CREATE TABLE IF NOT EXISTS feeds(id INTEGER PRIMARY KEY,url TEXT NOT NULL UNIQUE,title TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',image_url TEXT NOT NULL DEFAULT '',added_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS episodes(id INTEGER PRIMARY KEY,feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE CASCADE,guid TEXT NOT NULL,title TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',audio_url TEXT NOT NULL,published_at TEXT NOT NULL DEFAULT '',duration TEXT NOT NULL DEFAULT '',transcript_json TEXT,transcript_status TEXT NOT NULL DEFAULT 'none',transcript_error TEXT NOT NULL DEFAULT '',local_audio TEXT,UNIQUE(feed_id,guid));
+        CREATE TABLE IF NOT EXISTS sentence_translations(episode_id INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,content_key TEXT NOT NULL,target_language TEXT NOT NULL,provider TEXT NOT NULL,model TEXT NOT NULL,translation TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(episode_id,content_key,target_language,provider,model));
         """)
         # Additive migrations preserve existing local feeds, episodes, and transcripts.
         feed_columns = {r[1] for r in c.execute("PRAGMA table_info(feeds)")}
@@ -491,7 +495,185 @@ def get_transcript(episode_id: int) -> dict[str, Any]:
     transcript = json.loads(row["transcript_json"]) if row["transcript_json"] else None
     if isinstance(transcript, dict):
         transcript = normalize_transcript(transcript)
+        segments = transcript.get("segments")
+        if isinstance(segments, list):
+            for segment in segments:
+                if isinstance(segment, dict):
+                    segment["source_fingerprint"] = _segment_source_fingerprint(episode_id, segment)
     return {"status":row["transcript_status"],"error":row["transcript_error"],"transcript":transcript}
+
+def _segment_source_fingerprint(episode_id: int, segment: dict[str, Any]) -> str:
+    """Identify server transcript content/timing so stale browser indexes are rejected."""
+    try:
+        start, end = round(float(segment.get("start")), 3), round(float(segment.get("end")), 3)
+        text = segment.get("text")
+        if not isinstance(text, str) or start < 0 or end < start:
+            return ""
+    except (TypeError, ValueError, OverflowError):
+        return ""
+    identity = json.dumps({"episode_id": episode_id, "text": text.strip(), "start": start, "end": end},
+                          ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+def _current_segment_fingerprint(episode_id: int, segment_index: int) -> str:
+    """Read current transcript state for a final stale-index check around provider work."""
+    row = get_episode(episode_id)
+    if row["transcript_status"] != "ready" or not row["transcript_json"]:
+        return ""
+    try:
+        transcript = normalize_transcript(json.loads(row["transcript_json"]))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return ""
+    segments = transcript.get("segments") if isinstance(transcript, dict) else None
+    if not isinstance(segments, list) or segment_index < 0 or segment_index >= len(segments):
+        return ""
+    segment = segments[segment_index]
+    return _segment_source_fingerprint(episode_id, segment) if isinstance(segment, dict) else ""
+
+def _acquire_sentence_translation_lock(key: tuple[int, str]) -> threading.Lock:
+    with _translation_lock_guard:
+        lock, users = _translation_locks.get(key, (threading.Lock(), 0))
+        _translation_locks[key] = (lock, users + 1)
+    lock.acquire()
+    return lock
+
+def _release_sentence_translation_lock(key: tuple[int, str], lock: threading.Lock) -> None:
+    lock.release()
+    with _translation_lock_guard:
+        current_lock, users = _translation_locks[key]
+        if users <= 1:
+            del _translation_locks[key]
+        else:
+            _translation_locks[key] = (current_lock, users - 1)
+
+class TranslationInput(BaseModel):
+    expected_source_fingerprint: str
+
+def _gemini_translate_sentence(sentence: str, api_key: str) -> str:
+    """Translate one server-selected sentence; never expose provider errors or content."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    body = json.dumps({
+        "contents": [{"parts": [{"text": "Translate the following English sentence into natural Japanese for an English learner. Return only the Japanese translation, with no explanation or quotation marks.\n\n" + sentence}]}],
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1024},
+    }).encode("utf-8")
+    request = urllib.request.Request(url, data=body, headers={
+        "Content-Type": "application/json",
+        "x-goog-api-key": api_key,
+    }, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            raw = response.read(256 * 1024 + 1)
+        if len(raw) > 256 * 1024:
+            raise ValueError("oversized provider response")
+        payload = json.loads(raw.decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("invalid provider response")
+        candidates = payload.get("candidates")
+        if not isinstance(candidates, list) or len(candidates) != 1 or not isinstance(candidates[0], dict):
+            raise ValueError("invalid provider response")
+        candidate = candidates[0]
+        # MAX_TOKENS, SAFETY, and any unknown finish state can mean the result
+        # is partial or unsuitable; never persist or display it as a translation.
+        if candidate.get("finishReason") != "STOP":
+            raise ValueError("incomplete provider response")
+        content = candidate.get("content")
+        parts = content.get("parts") if isinstance(content, dict) else None
+        if not isinstance(parts, list) or not parts or any(not isinstance(part, dict) for part in parts):
+            raise ValueError("invalid provider response")
+        if any("text" in part and not isinstance(part["text"], str) for part in parts):
+            raise ValueError("invalid provider response")
+        translated = "".join(part.get("text", "") for part in parts).strip()
+        if not translated or len(translated) > 8000:
+            raise ValueError("invalid provider response")
+        return translated
+    except urllib.error.HTTPError as error:
+        # Do not read, log, or return the provider body; it may include request data.
+        if error.code == 429:
+            raise HTTPException(429, "Translation service quota or rate limit reached. Please try again later.") from None
+        if error.code in (401, 403):
+            raise HTTPException(503, "Translation service credentials are invalid or lack access. Contact the server administrator.") from None
+        if error.code in (500, 502, 503, 504):
+            raise HTTPException(503, "Translation service is temporarily unavailable. Please try again.") from None
+        raise HTTPException(502, "Translation service rejected the request. Please try again later.") from None
+    except (urllib.error.URLError, TimeoutError, ConnectionError):
+        raise HTTPException(503, "Translation service is temporarily unavailable. Please try again.") from None
+    except Exception:
+        # Malformed, blocked, or incomplete provider output is not cached or exposed.
+        raise HTTPException(502, "Translation service returned an incomplete or invalid response.") from None
+
+@app.post("/api/episodes/{episode_id}/translations/{segment_index}")
+def translate_episode_segment(episode_id: int, segment_index: int, payload: TranslationInput) -> dict[str, Any]:
+    """Return a cached or newly generated Japanese translation for one transcript line."""
+    row = get_episode(episode_id)
+    if row["transcript_status"] != "ready" or not row["transcript_json"]:
+        raise HTTPException(409, "A transcript is not available for this episode")
+    try:
+        transcript = normalize_transcript(json.loads(row["transcript_json"]))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        raise HTTPException(409, "A transcript is not available for this episode") from None
+    segments = transcript.get("segments") if isinstance(transcript, dict) else None
+    if not isinstance(segments, list) or segment_index < 0 or segment_index >= len(segments):
+        raise HTTPException(422, "Invalid transcript sentence")
+    segment = segments[segment_index]
+    if not isinstance(segment, dict):
+        raise HTTPException(422, "Invalid transcript sentence")
+    sentence = segment.get("text")
+    if not isinstance(sentence, str):
+        raise HTTPException(422, "Invalid transcript sentence")
+    sentence = sentence.strip()
+    if not sentence or len(sentence) > 4000:
+        raise HTTPException(422, "Invalid transcript sentence")
+    try:
+        start = round(float(segment.get("start")), 3)
+        end = round(float(segment.get("end")), 3)
+        if start < 0 or end < start:
+            raise ValueError("invalid timing")
+    except (TypeError, ValueError, OverflowError):
+        raise HTTPException(422, "Invalid transcript sentence") from None
+
+    expected_fingerprint = payload.expected_source_fingerprint
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_fingerprint):
+        raise HTTPException(422, "Invalid transcript sentence identity")
+    source_fingerprint = _segment_source_fingerprint(episode_id, segment)
+    if not source_fingerprint or expected_fingerprint != source_fingerprint:
+        raise HTTPException(409, "Transcript sentence changed. Refresh the transcript and try again.")
+
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    identity = json.dumps({"source_fingerprint": source_fingerprint,
+                           "target_language": "ja", "provider": "gemini", "model": GEMINI_MODEL},
+                          ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    content_key = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    def cached_translation() -> sqlite3.Row | None:
+        with db() as c:
+            return c.execute("SELECT translation FROM sentence_translations WHERE episode_id=? AND content_key=? AND target_language='ja' AND provider='gemini' AND model=?",
+                             (episode_id, content_key, GEMINI_MODEL)).fetchone()
+    cached = cached_translation()
+    if cached is not None:
+        return {"translation": cached["translation"], "cached": True, "target_language": "ja", "source_fingerprint": source_fingerprint}
+
+    lock_key = (episode_id, content_key)
+    lock = _acquire_sentence_translation_lock(lock_key)
+    try:
+        # Recheck after acquiring the per-sentence lock so concurrent taps share
+        # one provider request while unrelated cache hits remain nonblocking.
+        if _current_segment_fingerprint(episode_id, segment_index) != source_fingerprint:
+            raise HTTPException(409, "Transcript sentence changed. Refresh the transcript and try again.")
+        cached = cached_translation()
+        if cached is not None:
+            return {"translation": cached["translation"], "cached": True, "target_language": "ja", "source_fingerprint": source_fingerprint}
+        if not api_key:
+            raise HTTPException(503, "Japanese translation is not configured on this server")
+        translated = _gemini_translate_sentence(sentence, api_key)
+        if _current_segment_fingerprint(episode_id, segment_index) != source_fingerprint:
+            raise HTTPException(409, "Transcript sentence changed. Refresh the transcript and try again.")
+        with db() as c:
+            c.execute("INSERT OR IGNORE INTO sentence_translations(episode_id,content_key,target_language,provider,model,translation,created_at) VALUES(?,?,'ja','gemini',?,?,?)",
+                      (episode_id, content_key, GEMINI_MODEL, translated, datetime.now(timezone.utc).isoformat()))
+            stored = c.execute("SELECT translation FROM sentence_translations WHERE episode_id=? AND content_key=? AND target_language='ja' AND provider='gemini' AND model=?",
+                                (episode_id, content_key, GEMINI_MODEL)).fetchone()
+        return {"translation": stored["translation"], "cached": False, "target_language": "ja", "source_fingerprint": source_fingerprint}
+    finally:
+        _release_sentence_translation_lock(lock_key, lock)
 
 @app.get("/api/jobs/{job_id}")
 def get_job(job_id: str) -> dict[str, Any]:

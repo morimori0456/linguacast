@@ -1,5 +1,5 @@
 const $ = (selector) => document.querySelector(selector);
-const state = { feeds: [], episodes: [], feedId: null, episode: null, segments: [], activeLine: -1, loopLine: -1, speeds: [0.5, 0.75, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2], speedIndex: 3, pollTimer: null, toastTimer: null, followPlayback: true, touchStartY: null, touchStartTarget: null, seekDragging: false, lastPositionSaveAt: 0, lastSavedPosition: 0, lastMediaPositionAt: 0, switchingEpisode: false, episodeRequestId: 0, episodeLoading: false, positionReady: false, metadataRestoreHandler: null, metadataErrorHandler: null };
+const state = { feeds: [], episodes: [], feedId: null, episode: null, segments: [], translations: {}, translationRequests: new Set(), activeLine: -1, loopLine: -1, speeds: [0.5, 0.75, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2], speedIndex: 3, pollTimer: null, toastTimer: null, followPlayback: true, touchStartY: null, touchStartTarget: null, seekDragging: false, lastPositionSaveAt: 0, lastSavedPosition: 0, lastMediaPositionAt: 0, switchingEpisode: false, episodeRequestId: 0, episodeLoading: false, positionReady: false, metadataRestoreHandler: null, metadataErrorHandler: null };
 const audio = $('#audio');
 try {
   const savedRate = Number(localStorage.getItem('linguacast-playback-rate'));
@@ -78,6 +78,133 @@ function transcriptData(data) {
   return { status: data.status || root.status || 'ready', error: data.error || root.error || '', segments: root.segments || data.segments || [] };
 }
 
+function translationStorageKey() { return `linguacast-translations-${idOf(state.episode)}`; }
+function loadEpisodeTranslations(episodeId) {
+  state.translations = {};
+  state.translationRequests.clear();
+  try {
+    const saved = JSON.parse(localStorage.getItem(`linguacast-translations-${episodeId}`) || '{}');
+    if (saved && typeof saved === 'object' && !Array.isArray(saved)) {
+      state.translations = Object.fromEntries(Object.entries(saved)
+        .filter(([, entry]) => entry && /^[a-f0-9]{64}$/.test(entry.source_fingerprint || '') && typeof entry.translation === 'string')
+        .map(([index, entry]) => [index, { source_fingerprint: entry.source_fingerprint, translation: entry.translation, expanded: false }]));
+    }
+  } catch { /* Translation cache is optional. */ }
+}
+function saveEpisodeTranslations() {
+  if (!state.episode) return;
+  try { localStorage.setItem(translationStorageKey(), JSON.stringify(state.translations)); } catch { /* Translation still works without storage. */ }
+}
+function translationEntry(index) {
+  const entry = state.translations[index];
+  const fingerprint = state.segments[index]?.source_fingerprint;
+  return entry && (entry.source_fingerprint === fingerprint || (entry.error && !entry.source_fingerprint && !fingerprint)) ? entry : null;
+}
+function translationRequestKey(index, episodeId = idOf(state.episode)) { return `${episodeId}:${index}`; }
+function updateTranslationUI(index) {
+  const line = document.querySelector(`.transcript-line[data-line="${index}"]`);
+  if (!line) return;
+  const button = line.querySelector('.translation-toggle');
+  const panel = line.querySelector('.translation-content');
+  const entry = translationEntry(index);
+  const loading = state.translationRequests.has(translationRequestKey(index));
+  button.disabled = loading;
+  button.textContent = loading ? 'Translating…' : entry?.refreshRequired ? 'Refresh transcript' : entry?.error ? 'Retry translation' : entry?.translation ? (entry.expanded ? 'Hide Japanese' : 'Show Japanese') : 'Show Japanese';
+  button.setAttribute('aria-expanded', String(Boolean(entry?.expanded || loading)));
+  panel.hidden = !(entry?.expanded || loading);
+  panel.setAttribute('aria-busy', String(loading));
+  if (loading) { panel.textContent = 'Translating…'; panel.classList.add('translation-loading'); }
+  else {
+    panel.classList.remove('translation-loading');
+    panel.textContent = entry?.translation || entry?.error || '';
+  }
+  panel.classList.toggle('translation-error', Boolean(entry?.error));
+}
+async function toggleTranslation(index) {
+  if (!state.episode || !state.segments[index]) return;
+  const episodeId = idOf(state.episode);
+  const requestKey = translationRequestKey(index, episodeId);
+  if (state.translationRequests.has(requestKey)) return;
+  const sourceFingerprint = state.segments[index].source_fingerprint;
+  const current = translationEntry(index);
+  if (current?.refreshRequired) { await refreshTranscriptForTranslation(index); return; }
+  if (current?.translation) {
+    current.expanded = !current.expanded;
+    updateTranslationUI(index);
+    saveEpisodeTranslations();
+    return;
+  }
+  if (!/^[a-f0-9]{64}$/.test(sourceFingerprint || '')) {
+    state.translations[index] = { error: 'This sentence cannot be verified yet. Refresh the transcript and try again.', expanded: true, refreshRequired: true };
+    updateTranslationUI(index);
+    return;
+  }
+  state.translationRequests.add(requestKey);
+  updateTranslationUI(index);
+  const requestId = state.episodeRequestId;
+  try {
+    const result = await api(`/api/episodes/${encodeURIComponent(episodeId)}/translations/${index}`, {
+      method: 'POST',
+      body: JSON.stringify({ expected_source_fingerprint: sourceFingerprint }),
+    });
+    if (requestId !== state.episodeRequestId || String(idOf(state.episode)) !== String(episodeId)) return;
+    if (result.source_fingerprint !== sourceFingerprint) throw new Error('This sentence changed while translating. Refresh the transcript and try again.');
+    const translated = String(result.translation || '');
+    if (!translated) throw new Error('No translation was returned. Try again.');
+    state.translations[index] = { source_fingerprint: sourceFingerprint, translation: translated, expanded: true };
+    saveEpisodeTranslations();
+  } catch (error) {
+    if (requestId !== state.episodeRequestId) return;
+    const refreshRequired = error.status === 409;
+    const message = refreshRequired
+      ? 'This transcript sentence changed. Refresh the transcript before translating it.'
+      : error.message || 'Translation failed. Try again.';
+    state.translations[index] = { source_fingerprint: sourceFingerprint, error: message, expanded: true, refreshRequired };
+  } finally {
+    state.translationRequests.delete(requestKey);
+    if (requestId === state.episodeRequestId) updateTranslationUI(index);
+  }
+}
+
+async function refreshTranscriptForTranslation(index) {
+  const episodeId = idOf(state.episode);
+  const requestId = state.episodeRequestId;
+  const button = document.querySelector(`.translation-toggle[data-translation-line="${index}"]`);
+  if (button) { button.disabled = true; button.textContent = 'Refreshing…'; }
+  const scrollY = window.scrollY;
+  const loopFingerprint = state.loopLine >= 0 ? state.segments[state.loopLine]?.source_fingerprint : null;
+  try {
+    const result = await api(`/api/episodes/${encodeURIComponent(episodeId)}/transcript`);
+    if (requestId !== state.episodeRequestId || String(idOf(state.episode)) !== String(episodeId)) return;
+    const transcript = transcriptData(result);
+    if (!transcript.segments.length) throw new Error('The refreshed transcript is not ready yet. Try again shortly.');
+    state.segments = transcript.segments;
+    Object.values(state.translations).forEach((entry) => { if (entry) entry.expanded = false; });
+    saveEpisodeTranslations();
+    renderTranscript();
+    const refreshedLoop = loopFingerprint ? state.segments.findIndex((segment) => segment.source_fingerprint === loopFingerprint) : -1;
+    setLoop(refreshedLoop, refreshedLoop >= 0);
+    const followPlayback = state.followPlayback;
+    state.followPlayback = false;
+    state.activeLine = -1;
+    updatePlayer();
+    state.followPlayback = followPlayback;
+    window.scrollTo({ top: scrollY, behavior: 'auto' });
+    showToast('Transcript refreshed');
+  } catch (error) {
+    if (requestId !== state.episodeRequestId) return;
+    showToast(`Could not refresh transcript: ${error.message}`);
+    const entry = state.translations[index];
+    if (entry) entry.error = error.message;
+    updateTranslationUI(index);
+  } finally {
+    if (requestId === state.episodeRequestId) {
+      const refreshedButton = document.querySelector(`.translation-toggle[data-translation-line="${index}"]`);
+      if (refreshedButton) refreshedButton.disabled = false;
+    }
+  }
+}
+
 async function openEpisode(episodeId) {
   const requestId = ++state.episodeRequestId;
   state.episodeLoading = true;
@@ -97,6 +224,7 @@ async function openEpisode(episodeId) {
     state.followPlayback = true; $('#follow-playback').hidden = true;
     setLoop(-1);
     state.episode = item;
+    loadEpisodeTranslations(episodeId);
     state.lastPositionSaveAt = 0; state.lastSavedPosition = 0;
     $('#home-view').hidden = true; $('#player-view').hidden = false;
     $('#player-title').textContent = titleOf(item);
@@ -163,7 +291,9 @@ function renderTranscript() {
       return `${space}<span class="word" data-line="${index}" data-word="${wordIndex}" data-start="${wordStart}" data-end="${wordEnd}">${escapeHTML(text)}</span>`;
     }).join('') : escapeHTML(segment.text || '');
     if (!words.length) wordsHTML = `<span class="word" data-line="${index}" data-word="0" data-start="${start}" data-end="${end}">${wordsHTML}</span>`;
-    return `<article class="transcript-line" data-line="${index}" data-start="${start}" data-end="${end}"><button type="button" class="line-time" data-play-line="${index}" aria-label="Play from ${fmtTime(start)}">${fmtTime(start)}</button><span class="line-text">${wordsHTML}</span><button class="line-loop" data-loop-line="${index}" aria-label="Repeat this sentence" aria-pressed="false">↻</button></article>`;
+    const cached = translationEntry(index);
+    const translationHTML = cached?.translation ? escapeHTML(cached.translation) : cached?.error ? escapeHTML(cached.error) : '';
+    return `<article class="transcript-line" data-line="${index}" data-start="${start}" data-end="${end}"><button type="button" class="line-time" data-play-line="${index}" aria-label="Play from ${fmtTime(start)}">${fmtTime(start)}</button><span class="line-text">${wordsHTML}</span><div class="translation-tools"><button type="button" class="translation-toggle" data-translation-line="${index}" aria-expanded="false" aria-controls="translation-${index}">Show Japanese</button><div id="translation-${index}" class="translation-content" aria-live="polite" hidden>${translationHTML}</div></div><button class="line-loop" data-loop-line="${index}" aria-label="Repeat this sentence" aria-pressed="false">↻</button></article>`;
   }).join('');
 }
 
@@ -377,6 +507,8 @@ $('#player-back').addEventListener('click', () => { state.episodeRequestId += 1;
 $('#transcribe-button').addEventListener('click', startTranscription);
 $('#follow-playback').addEventListener('click', () => setPlaybackFollow(true));
 $('#transcript-lines').addEventListener('click', (event) => {
+  const translation = event.target.closest('[data-translation-line]');
+  if (translation) { event.preventDefault(); event.stopPropagation(); toggleTranslation(Number(translation.dataset.translationLine)); return; }
   const seekLine = event.target.closest('[data-play-line]');
   if (seekLine) {
     if (state.loopLine >= 0) { setLoop(-1); showToast('Sentence repeat turned off'); }

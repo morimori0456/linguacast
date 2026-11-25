@@ -68,6 +68,21 @@ WHISPER_MODEL=base.en uvicorn app:app --host 127.0.0.1 --port 8000
 
 `WHISPER_CPU_THREADS` can set the number of CPU threads. Transcription time depends on your processor, model, audio, and other workloads; long episodes can take a while. LinguaCast processes one transcription at a time.
 
+## Optional Japanese sentence translations
+
+When a transcript is ready, tap **Show Japanese** under a sentence to request its Japanese translation. Translations are hidden by default. The first request for a sentence is sent to Google's Gemini API using `gemini-4-hydrogen`; later requests for the same transcript sentence use LinguaCast's local cache. Cached translations are hidden again when the episode is reopened. If the transcript sentence changes, its old translation is not reused. If the feature is not configured, LinguaCast displays an informational message. Provider failures are shown as generic retry guidance; API keys and raw provider error responses are not sent to the browser.
+
+To enable translations, create a Gemini API key in [Google AI Studio](https://aistudio.google.com/app/apikey), then set it in the environment used to start the LinguaCast server:
+
+```sh
+export GEMINI_API_KEY="your-api-key"
+uvicorn app:app --host 127.0.0.1 --port 8000
+```
+
+Keep the key on the server: do not put it in browser code, commit it, or share it. Set it through your environment or a secret manager before starting the app. The app does not need a Gemini API key for local speech transcription or podcast playback.
+
+**Privacy and cost:** Translation is on demand. When you tap a sentence for the first time, LinguaCast sends that transcript sentence to Google's Gemini API over the internet for translation. It does not send the episode audio or the entire transcript for this request. The sentence and returned translation are cached on the LinguaCast server; the browser also keeps a local copy so it can stay hidden and be shown again without another API request. Do not use this feature for text you do not want to send to Google. Google's Gemini API [pricing and data-use terms](https://ai.google.dev/gemini-api/docs/pricing) can change: the free tier has usage limits and may use submitted content to improve Google products, while paid API usage is billed by token and is not used for product improvement under the current terms. Check the current pricing and terms before use. A Gemini app or Google AI plan subscription is separate from Gemini API access and does not pay for this app's API requests; API usage is associated with the Google AI Studio project and its billing settings. See Google's [API setup guide](https://ai.google.dev/gemini-api/docs/get-started) for key and billing details.
+
 ## Data and limitations
 
 - Feed details, episode records, transcripts, and downloaded episode audio are stored locally in `data/` by default. Change the location with `PODCAST_DATA_DIR=/path/to/data`.

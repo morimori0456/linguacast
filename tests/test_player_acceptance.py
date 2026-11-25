@@ -96,6 +96,7 @@ class PlayerAcceptanceTest(unittest.TestCase):
                         "start": 0.2,
                         "end": 0.85,
                         "text": "A short sentence.",
+                        "source_fingerprint": "a" * 64,
                         "words": [
                             {"start": 0.2, "end": 0.38, "word": "A"},
                             {"start": 0.39, "end": 0.58, "word": "short"},
@@ -106,6 +107,7 @@ class PlayerAcceptanceTest(unittest.TestCase):
                         "start": 1.1,
                         "end": 1.8,
                         "text": "Another sentence.",
+                        "source_fingerprint": "b" * 64,
                         "words": [
                             {"start": 1.1, "end": 1.42, "word": "Another"},
                             {"start": 1.43, "end": 1.8, "word": "sentence."},
@@ -115,6 +117,8 @@ class PlayerAcceptanceTest(unittest.TestCase):
             },
         }
         transcribe_started = threading.Event()
+        translation_requests = []
+        transcript_requests = []
 
         def fulfill_api(route) -> None:
             request = route.request
@@ -130,12 +134,21 @@ class PlayerAcceptanceTest(unittest.TestCase):
                 episode_id = int(path.rsplit("/", 1)[-1])
                 route.fulfill(json=next(ep for ep in episodes if ep["id"] == episode_id))
             elif path == "/api/episodes/101/transcript":
+                transcript_requests.append(path)
                 route.fulfill(json=transcript)
             elif path == "/api/episodes/102/transcript":
                 route.fulfill(json={"status": "none", "transcript": None})
             elif path == "/api/episodes/102/transcribe" and method == "POST":
                 transcribe_started.set()
                 route.fulfill(status=202, json={"job_id": "acceptance-job", "status": "queued"})
+            elif path == "/api/episodes/101/translations/0" and method == "POST":
+                translation_requests.append(path)
+                self.assertEqual(request.post_data_json, {"expected_source_fingerprint": "a" * 64})
+                route.fulfill(json={"translation": "架空の短い文です。", "cached": False, "target_language": "ja", "source_fingerprint": "a" * 64})
+            elif path == "/api/episodes/101/translations/1" and method == "POST":
+                translation_requests.append(path)
+                self.assertEqual(request.post_data_json, {"expected_source_fingerprint": "b" * 64})
+                route.fulfill(status=409, json={"detail": "Transcript sentence changed. Refresh the transcript and try again."})
             elif path.startswith("/api/episodes/") and path.endswith("/audio"):
                 route.fulfill(
                     status=200,
@@ -184,6 +197,43 @@ class PlayerAcceptanceTest(unittest.TestCase):
                 page.wait_for_function("Math.abs(Number(document.querySelector('#seek').value) - 600) < 20")
                 self.assertAlmostEqual(page.locator("#audio").evaluate("audio => audio.currentTime"), 4.2, delta=0.25)
 
+                # Japanese is hidden until requested. Toggling it must not
+                # trigger word seeking or otherwise move the audio position.
+                translation_toggle = page.locator('.translation-toggle[data-translation-line="0"]')
+                translation_panel = page.locator('#translation-0')
+                self.assertFalse(translation_panel.is_visible())
+                time_before_translation = page.locator("#audio").evaluate("audio => audio.currentTime")
+                translation_toggle.click()
+                page.get_by_text("架空の短い文です。", exact=True).wait_for()
+                self.assertTrue(translation_panel.is_visible())
+                self.assertEqual(translation_toggle.get_attribute("aria-expanded"), "true")
+                self.assertAlmostEqual(page.locator("#audio").evaluate("audio => audio.currentTime"), time_before_translation, delta=0.05)
+                translation_toggle.click()
+                self.assertFalse(translation_panel.is_visible())
+                self.assertEqual(translation_toggle.get_attribute("aria-expanded"), "false")
+                self.assertEqual(len(translation_requests), 1, "the translation is requested only on first reveal")
+                self.assertAlmostEqual(page.locator("#audio").evaluate("audio => audio.currentTime"), time_before_translation, delta=0.05)
+
+                # A 409 offers transcript refresh. The refresh rerenders the
+                # transcript and collapses an earlier translation; its first
+                # click afterward must reopen the cached Japanese text.
+                translation_toggle.click()
+                self.assertTrue(translation_panel.is_visible())
+                second_line_toggle = page.locator('.translation-toggle[data-translation-line="1"]')
+                second_line_toggle.click()
+                page.get_by_text("This transcript sentence changed. Refresh the transcript before translating it.", exact=True).wait_for()
+                self.assertEqual(second_line_toggle.inner_text(), "Refresh transcript")
+                second_line_toggle.click()
+                page.wait_for_function("document.querySelectorAll('#transcript-lines .transcript-line').length === 2")
+                self.assertEqual(len(transcript_requests), 2, "refresh action should reload transcript data")
+                page.get_by_text("Transcript refreshed", exact=True).wait_for()
+                self.assertFalse(translation_panel.is_visible(), "refresh collapses the previously open translation")
+                self.assertEqual(translation_toggle.inner_text(), "Show Japanese")
+                translation_toggle.click()
+                self.assertTrue(translation_panel.is_visible(), "the first post-refresh click should expand the cached translation")
+                self.assertEqual(translation_toggle.inner_text(), "Hide Japanese")
+                self.assertEqual(translation_requests.count("/api/episodes/101/translations/0"), 1, "reopening cached translation should not POST again")
+
                 # A sentence loop must wrap to the selected sentence boundary
                 # and remain active across the boundary.
                 page.locator('.line-loop[data-loop-line="0"]').click()
@@ -212,6 +262,74 @@ class PlayerAcceptanceTest(unittest.TestCase):
 
     def test_delayed_transcript_from_previous_episode_is_ignored(self) -> None:
         asyncio.run(self._exercise_delayed_transcript_race())
+
+    def test_translation_button_ignores_duplicate_taps_while_pending(self) -> None:
+        asyncio.run(self._exercise_translation_pending_click())
+
+    async def _exercise_translation_pending_click(self) -> None:
+        feed = {"id": 40, "title": "Pending Translation Test"}
+        episode = {"id": 401, "feed_id": 40, "title": "Pending translation", "audio_path": "/api/episodes/401/audio"}
+        fingerprint = "c" * 64
+        transcript = {"status": "ready", "transcript": {"segments": [{
+            "start": 0.2, "end": 0.85, "text": "One pending sentence.", "source_fingerprint": fingerprint,
+            "words": [{"start": 0.2, "end": 0.85, "word": "One pending sentence."}],
+        }]}}
+        request_started = asyncio.Event()
+        release_response = asyncio.Event()
+        translation_requests: list[str] = []
+        errors: list[str] = []
+
+        async def fulfill_api(route) -> None:
+            path = route.request.url.split(self.base_url, 1)[-1].split("?", 1)[0]
+            method = route.request.method
+            if path == "/api/feeds" and method == "GET":
+                await route.fulfill(json=[feed])
+            elif path == "/api/feeds/40/refresh":
+                await route.fulfill(json={"episode_count": 1})
+            elif path == "/api/feeds/40/episodes":
+                await route.fulfill(json=[episode])
+            elif path == "/api/episodes/401":
+                await route.fulfill(json=episode)
+            elif path == "/api/episodes/401/transcript":
+                await route.fulfill(json=transcript)
+            elif path == "/api/episodes/401/translations/0" and method == "POST":
+                translation_requests.append(path)
+                self.assertEqual(route.request.post_data_json, {"expected_source_fingerprint": fingerprint})
+                request_started.set()
+                await release_response.wait()
+                await route.fulfill(json={"translation": "待機中のテスト訳です。", "cached": False, "target_language": "ja", "source_fingerprint": fingerprint})
+            elif path.endswith("/audio"):
+                await route.fulfill(body=self.audio_bytes, content_type="audio/wav")
+            else:
+                await route.fulfill(status=404, json={"detail": f"Unexpected API request: {method} {path}"})
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(
+                executable_path=os.environ.get("CHROMIUM_PATH") or None,
+                headless=True,
+                args=["--no-sandbox", "--autoplay-policy=no-user-gesture-required"],
+            )
+            page = await browser.new_page(viewport={"width": 390, "height": 844}, is_mobile=True, has_touch=True)
+            page.set_default_timeout(5000)
+            await page.route("**/api/**", fulfill_api)
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            try:
+                await page.goto(self.base_url, wait_until="domcontentloaded")
+                await page.locator('[data-feed-id="40"]').click()
+                await page.locator('[data-episode-id="401"]').click()
+                toggle = page.locator('.translation-toggle[data-translation-line="0"]')
+                await toggle.click()
+                await asyncio.wait_for(request_started.wait(), timeout=3)
+                self.assertTrue(await toggle.is_disabled())
+                await toggle.evaluate("button => button.dispatchEvent(new MouseEvent('click', { bubbles: true }))")
+                await page.wait_for_timeout(100)
+                self.assertEqual(translation_requests, ["/api/episodes/401/translations/0"], "a second tap during the pending request must not start another translation")
+                release_response.set()
+                await page.get_by_text("待機中のテスト訳です。", exact=True).wait_for()
+                self.assertEqual(errors, [], f"Unexpected browser errors: {errors}")
+            finally:
+                release_response.set()
+                await browser.close()
 
     async def _exercise_delayed_transcript_race(self) -> None:
         feed = {"id": 20, "title": "Race Test Podcast"}
