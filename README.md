@@ -78,6 +78,8 @@ To use translations, install and sign in to `agy` on the machine running LinguaC
 
 The `agy` integration includes offline, mocked tests. An authenticated synthetic translation was also verified in a systemd user service; account availability and quotas depend on your own environment.
 
+If an iPhone home-screen app still shows an older interface after an update, close it fully from the app switcher and reopen it.
+
 ## Data and limitations
 
 - Feed details, episode records, transcripts, and downloaded episode audio are stored locally in `data/` by default. Change the location with `PODCAST_DATA_DIR=/path/to/data`.

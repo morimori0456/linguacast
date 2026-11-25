@@ -640,7 +640,7 @@ def get_job(job_id: str) -> dict[str, Any]:
 def index() -> FileResponse:
     file = BASE_DIR / "index.html"
     if not file.exists(): raise HTTPException(503,"Frontend is not installed yet")
-    return FileResponse(file)
+    return FileResponse(file, headers={"Cache-Control": "no-cache"})
 
 assets = BASE_DIR / "assets"
 if assets.is_dir(): app.mount("/assets",StaticFiles(directory=assets),name="assets")
