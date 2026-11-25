@@ -1,5 +1,13 @@
 const $ = (selector) => document.querySelector(selector);
-const state = { feeds: [], episodes: [], feedId: null, episode: null, segments: [], translations: {}, translationRequests: new Set(), activeLine: -1, loopLine: -1, speeds: [0.5, 0.75, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2], speedIndex: 3, pollTimer: null, translationPrefetchTimer: null, toastTimer: null, followPlayback: true, touchStartY: null, touchStartTarget: null, seekDragging: false, lastPositionSaveAt: 0, lastSavedPosition: 0, lastMediaPositionAt: 0, switchingEpisode: false, episodeRequestId: 0, episodeLoading: false, positionReady: false, metadataRestoreHandler: null, metadataErrorHandler: null };
+const SKIP_INTERVAL_MIN = 1;
+const SKIP_INTERVAL_MAX = 300;
+function readSkipInterval(key, fallback) {
+  try {
+    const value = Number(localStorage.getItem(key));
+    return Number.isInteger(value) && value >= SKIP_INTERVAL_MIN && value <= SKIP_INTERVAL_MAX ? value : fallback;
+  } catch { return fallback; }
+}
+const state = { feeds: [], episodes: [], feedId: null, episode: null, segments: [], translations: {}, translationRequests: new Set(), activeLine: -1, loopLine: -1, rewindSeconds: readSkipInterval('linguacast-rewind-seconds', 10), forwardSeconds: readSkipInterval('linguacast-forward-seconds', 30), speeds: [0.5, 0.75, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2], speedIndex: 3, pollTimer: null, translationPrefetchTimer: null, toastTimer: null, followPlayback: true, touchStartY: null, touchStartTarget: null, seekDragging: false, lastPositionSaveAt: 0, lastSavedPosition: 0, lastMediaPositionAt: 0, switchingEpisode: false, episodeRequestId: 0, episodeLoading: false, positionReady: false, metadataRestoreHandler: null, metadataErrorHandler: null };
 const audio = $('#audio');
 try {
   const savedRate = Number(localStorage.getItem('linguacast-playback-rate'));
@@ -21,6 +29,33 @@ function setPlaybackSpeed(value) {
   document.querySelectorAll('.speed-option').forEach((button) => button.setAttribute('aria-pressed', String(Number(button.dataset.speed) === speed)));
   $('#speed-menu').hidden = true;
   $('#speed-button').setAttribute('aria-expanded', 'false');
+}
+function setSkipInterval(direction, rawValue) {
+  const value = Number(rawValue);
+  const key = direction === 'rewind' ? 'rewindSeconds' : 'forwardSeconds';
+  const storageKey = direction === 'rewind' ? 'linguacast-rewind-seconds' : 'linguacast-forward-seconds';
+  if (!Number.isInteger(value) || value < SKIP_INTERVAL_MIN || value > SKIP_INTERVAL_MAX) {
+    $(`#${direction}-seconds`).value = String(state[key]);
+    showToast('Choose a whole number from 1 to 300 seconds');
+    return false;
+  }
+  state[key] = value;
+  try { localStorage.setItem(storageKey, String(value)); } catch { /* Keep the current setting for this session. */ }
+  updateSkipControls();
+  return true;
+}
+function updateSkipControls() {
+  $('#rewind-button').textContent = `−${state.rewindSeconds}`;
+  $('#rewind-button').setAttribute('aria-label', `Rewind ${state.rewindSeconds} seconds`);
+  $('#rewind-button').title = `Rewind ${state.rewindSeconds} seconds`;
+  $('#forward-button').textContent = `+${state.forwardSeconds}`;
+  $('#forward-button').setAttribute('aria-label', `Skip forward ${state.forwardSeconds} seconds`);
+  $('#forward-button').title = `Skip forward ${state.forwardSeconds} seconds`;
+}
+function seekBy(offset) {
+  const duration = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : Infinity;
+  audio.currentTime = Math.max(0, Math.min(duration, audio.currentTime + offset));
+  savePosition(true);
 }
 const idOf = (item) => item.id ?? item.feed_id ?? item.episode_id;
 const titleOf = (item) => item.title || item.name || 'Untitled';
@@ -431,11 +466,16 @@ function setLoop(index, enabled = true) {
   state.loopLine = enabled ? index : -1;
   document.querySelectorAll('.line-loop').forEach((button) => {
     const active = Number(button.dataset.loopLine) === state.loopLine;
+    button.classList.toggle('active', active);
     button.setAttribute('aria-pressed', String(active));
     button.setAttribute('aria-label', active ? 'Stop repeating this sentence' : 'Repeat this sentence');
+    button.title = active ? 'Stop repeating this sentence' : 'Repeat this sentence';
+    button.closest('.transcript-line')?.classList.toggle('looping', active);
   });
   $('#repeat-button').classList.toggle('active', state.loopLine >= 0);
   $('#repeat-button').setAttribute('aria-pressed', String(state.loopLine >= 0));
+  $('#repeat-button').setAttribute('aria-label', state.loopLine >= 0 ? 'Stop sentence repeat' : 'Repeat selected sentence');
+  $('#repeat-button').title = state.loopLine >= 0 ? 'Stop sentence repeat' : 'Repeat selected sentence';
 }
 
 function scrollToActiveLine(index = state.activeLine) {
@@ -621,8 +661,32 @@ $('#speed-button').addEventListener('click', () => {
 $('#speed-menu').addEventListener('click', (event) => { const choice = event.target.closest('[data-speed]'); if (choice) { setPlaybackSpeed(choice.dataset.speed); $('#speed-button').focus(); } });
 document.addEventListener('pointerdown', (event) => { if (!event.target.closest('.speed-control') && !$('#speed-menu').hidden) { $('#speed-menu').hidden = true; $('#speed-button').setAttribute('aria-expanded', 'false'); } });
 document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && !$('#speed-menu').hidden) { $('#speed-menu').hidden = true; $('#speed-button').setAttribute('aria-expanded', 'false'); $('#speed-button').focus(); } });
-$('#rewind-button').addEventListener('click', () => { audio.currentTime = Math.max(0, audio.currentTime - 10); });
-$('#forward-button').addEventListener('click', () => { audio.currentTime = Math.min(audio.duration || Infinity, audio.currentTime + 30); });
+$('#rewind-button').addEventListener('click', () => seekBy(-state.rewindSeconds));
+$('#forward-button').addEventListener('click', () => seekBy(state.forwardSeconds));
+updateSkipControls();
+$('#rewind-seconds').value = String(state.rewindSeconds);
+$('#forward-seconds').value = String(state.forwardSeconds);
+$('#skip-settings-button').addEventListener('click', () => {
+  const menu = $('#skip-settings-menu');
+  menu.hidden = !menu.hidden;
+  $('#skip-settings-button').setAttribute('aria-expanded', String(!menu.hidden));
+  if (!menu.hidden) $('#rewind-seconds').focus();
+});
+$('#rewind-seconds').addEventListener('change', (event) => setSkipInterval('rewind', event.currentTarget.value));
+$('#forward-seconds').addEventListener('change', (event) => setSkipInterval('forward', event.currentTarget.value));
+document.addEventListener('pointerdown', (event) => {
+  if (!event.target.closest('.player-settings-row') && !$('#skip-settings-menu').hidden) {
+    $('#skip-settings-menu').hidden = true;
+    $('#skip-settings-button').setAttribute('aria-expanded', 'false');
+  }
+});
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && !$('#skip-settings-menu').hidden) {
+    $('#skip-settings-menu').hidden = true;
+    $('#skip-settings-button').setAttribute('aria-expanded', 'false');
+    $('#skip-settings-button').focus();
+  }
+});
 $('#repeat-button').addEventListener('click', () => {
   const index = state.activeLine >= 0 ? state.activeLine : 0;
   if (!state.segments[index]) { showToast('Create a transcript to repeat a sentence'); return; }
@@ -658,8 +722,8 @@ if (navigator.mediaSession) {
   const actions = {
     play: () => audio.play().catch(() => {}),
     pause: () => audio.pause(),
-    seekbackward: (detail) => { audio.currentTime = Math.max(0, audio.currentTime - (detail.seekOffset || 10)); savePosition(true); },
-    seekforward: (detail) => { audio.currentTime = Math.min(audio.duration || Infinity, audio.currentTime + (detail.seekOffset || 30)); savePosition(true); },
+    seekbackward: (detail = {}) => seekBy(-(Number.isFinite(detail.seekOffset) ? Math.abs(detail.seekOffset) : state.rewindSeconds)),
+    seekforward: (detail = {}) => seekBy(Number.isFinite(detail.seekOffset) ? Math.abs(detail.seekOffset) : state.forwardSeconds),
     seekto: (detail) => { if (Number.isFinite(detail.seekTime)) { if (typeof audio.fastSeek === 'function') audio.fastSeek(detail.seekTime); else audio.currentTime = detail.seekTime; savePosition(true); } },
   };
   for (const [action, handler] of Object.entries(actions)) { try { navigator.mediaSession.setActionHandler(action, handler); } catch { /* Action is unsupported by this browser. */ } }
