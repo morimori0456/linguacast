@@ -75,7 +75,7 @@ button:focus-visible,input:focus-visible,a:focus-visible{outline:3px solid #476f
 .speed-option{min-height:44px;font-size:14px}
 .control-button{width:44px;height:44px;font-size:13px}
 .play-button{width:48px;height:48px;min-height:48px}
-.repeat-button{min-width:44px;min-height:44px;padding:8px 4px;font-size:14px}
+.repeat-button{min-width:44px;min-height:44px;padding:8px 4px;font-size:14px;justify-content:center}
 .progress-wrap{font-size:12px;color:#4f5b51}
 .progress-wrap input{height:44px;min-height:44px;padding:0;border:0;background:transparent;touch-action:pan-y}
 .progress-wrap input::-webkit-slider-runnable-track{height:4px;border-radius:99px;background:#9fa99f}

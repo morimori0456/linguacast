@@ -330,6 +330,12 @@ class PlayerAcceptanceTest(unittest.TestCase):
                 self.assertIn("active", line_loop.get_attribute("class"))
                 self.assertIn("looping", page.locator('.transcript-line[data-line="0"]').get_attribute("class"))
                 self.assertEqual(page.locator("#repeat-button").get_attribute("aria-label"), "Stop sentence repeat")
+                repeat_player_box = page.locator("#repeat-button").bounding_box()
+                repeat_icon_box = page.locator("#repeat-button svg").bounding_box()
+                self.assertAlmostEqual(repeat_player_box["x"] + repeat_player_box["width"] / 2,
+                                       repeat_icon_box["x"] + repeat_icon_box["width"] / 2, delta=1)
+                self.assertAlmostEqual(repeat_player_box["y"] + repeat_player_box["height"] / 2,
+                                       repeat_icon_box["y"] + repeat_icon_box["height"] / 2, delta=1)
                 page.wait_for_timeout(1200)
                 current_time = page.locator("#audio").evaluate("audio => audio.currentTime")
                 self.assertLess(current_time, 1.1, "audio should wrap before leaving the selected sentence")
