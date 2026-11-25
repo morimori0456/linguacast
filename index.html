@@ -11,7 +11,7 @@
     <link rel="icon" type="image/png" sizes="32x32" href="/assets/header-icon-32.png" />
     <link rel="apple-touch-icon" sizes="180x180" href="/assets/header-icon-180.png" />
     <link rel="manifest" href="/manifest.json" />
-    <link rel="stylesheet" href="/styles.css?v=10" />
+    <link rel="stylesheet" href="/styles.css?v=11" />
   </head>
   <body>
     <div class="app-shell">
@@ -75,6 +75,14 @@
 
         <div class="player-spacer"></div>
         <section class="mini-player" aria-label="Audio player" role="region">
+          <div class="player-settings-row">
+            <button class="skip-settings-button" id="skip-settings-button" type="button" aria-label="Skip settings" title="Skip settings" aria-haspopup="true" aria-controls="skip-settings-menu" aria-expanded="false">⚙</button>
+            <div class="skip-settings-menu" id="skip-settings-menu" role="group" aria-label="Skip interval settings" hidden>
+              <label for="rewind-seconds">Rewind</label><div class="skip-setting-input"><input id="rewind-seconds" type="number" min="1" max="300" step="1" inputmode="numeric" /><span>seconds</span></div>
+              <label for="forward-seconds">Skip forward</label><div class="skip-setting-input"><input id="forward-seconds" type="number" min="1" max="300" step="1" inputmode="numeric" /><span>seconds</span></div>
+              <p class="skip-settings-hint">Choose 1–300 seconds.</p>
+            </div>
+          </div>
           <div class="progress-wrap" role="group" aria-label="Playback position">
             <span id="current-time">0:00</span><input id="seek" type="range" min="0" max="1000" step="1" value="0" aria-label="Playback position" /><span id="duration">0:00</span>
           </div>
@@ -90,6 +98,6 @@
 
     </div>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
-    <script src="/app.js?v=10" defer></script>
+    <script src="/app.js?v=11" defer></script>
   </body>
 </html>
