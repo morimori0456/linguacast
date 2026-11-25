@@ -235,6 +235,42 @@ class TranslationRunnerTest(unittest.TestCase):
             with self.assertRaises(runner.TranslationRunnerError):
                 runner.translate_sentence("Synthetic.")
 
+    def test_batch_translation_uses_one_cli_request_and_parses_indexed_json(self) -> None:
+        batch = ["Synthetic first sentence.", "Synthetic second sentence."]
+        output = json.dumps({"translations": [
+            {"index": 0, "translation": "一つ目。"},
+            {"index": 1, "translation": "二つ目。"},
+        ]}, ensure_ascii=False)
+        fake = self.fake_agy(output=(json.dumps({"event": "result", "result": {
+            "status": "SUCCESS", "response": output,
+        }}, ensure_ascii=False) + "\n"))
+        with patch.object(runner.Path, "home", return_value=self.safe_user_home):
+            self.assertEqual(runner.translate_sentences(batch, executable=str(fake)), ["一つ目。", "二つ目。"])
+        details = json.loads(self.record.read_text(encoding="utf-8"))
+        self.assertIn("Synthetic first sentence.", details["stdin"])
+        self.assertIn("Synthetic second sentence.", details["stdin"])
+        self.assertNotIn(batch[0], json.dumps(details["argv"], ensure_ascii=False))
+
+    def test_batch_translation_rejects_partial_duplicate_or_extra_items(self) -> None:
+        malformed = [
+            {"translations": [{"index": 0, "translation": "only one"}]},
+            {"translations": [{"index": 0, "translation": "one"}, {"index": 0, "translation": "duplicate"}]},
+            {"translations": [{"index": 0, "translation": "one"}, {"index": 1, "translation": "two", "extra": "x"}]},
+            {"translations": [{"index": 0, "translation": "one"}, {"index": 2, "translation": "out of range"}]},
+        ]
+        for payload in malformed:
+            event = json.dumps({"event": "result", "result": {
+                "status": "SUCCESS", "response": json.dumps(payload, ensure_ascii=False),
+            }}, ensure_ascii=False).encode() + b"\n"
+            with self.subTest(payload=payload), self.assertRaises(runner.TranslationRunnerError):
+                runner._extract_batch_translations(event, 2)
+
+    def test_batch_bounds_input_count_and_total_characters(self) -> None:
+        with self.assertRaises(runner.TranslationRunnerError):
+            runner.translate_sentences(["x"] * (runner.MAX_BATCH_SENTENCES + 1), executable="/bin/true")
+        with self.assertRaises(runner.TranslationRunnerError):
+            runner.translate_sentences(["x" * runner.MAX_BATCH_INPUT_CHARS, "y"], executable="/bin/true")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -103,6 +103,8 @@ button:focus-visible,input:focus-visible,a:focus-visible{outline:3px solid #476f
 .follow-playback{min-height:44px;font-size:14px}
 .feed-sync-warning{display:block;margin-top:4px;color:#a14d3f;font-size:10px;font-weight:700;line-height:1.2}
 
+.translation-prefetch-status{margin:0 0 10px;color:#65715f;font-size:12px;line-height:1.45}
+.translation-prefetch-status[hidden]{display:none}
 /* Keep the timestamp and sentence actions in a stable row; align both languages. */
 .transcript-line{padding:12px 0}
 .transcript-line.active{margin-left:-7px;padding-left:7px}
