@@ -73,6 +73,109 @@ class AutoTranscriptionTest(unittest.TestCase):
                 "SELECT * FROM episodes WHERE feed_id=? ORDER BY guid", (self.feed_id,)
             )]
 
+    def test_rfc5322_negative_zero_is_utc_but_timezone_missing_is_unknown(self) -> None:
+        parsed = backend._published_time("Tue, 24 Nov 2026 00:00:00 -0000")
+        self.assertEqual(parsed, datetime(2026, 11, 24, tzinfo=timezone.utc))
+        self.assertIsNone(backend._published_time("Tue, 24 Nov 2026 00:00:00"))
+
+    def test_refresh_does_not_mutate_or_infer_provenance_for_existing_unclassified_episode(self) -> None:
+        existing_date = "Tue, 24 Nov 2026 00:00:00 -0000"
+        with backend.db() as conn:
+            conn.execute("UPDATE feeds SET auto_since=? WHERE id=?", ("2026-11-23T00:00:00+00:00", self.feed_id))
+            conn.execute(
+                "INSERT INTO episodes(feed_id,guid,title,audio_url,published_at,publication_time) VALUES(?,?,?,?,?,?)",
+                (self.feed_id, "previously-skipped", "Previously skipped", "https://example.test/skipped.mp3", existing_date, ""),
+            )
+
+        with self.parse_records([episode("previously-skipped", existing_date)]):
+            backend.refresh_feed_internal(self.feed_id)
+            backend.refresh_feed_internal(self.feed_id)
+
+        row = self.rows()[0]
+        self.assertEqual(row["publication_time"], "")
+        self.assertEqual((row["auto_eligible"], row["transcript_status"]), (0, "none"))
+        self.assertEqual(self.executor.submit.call_count, 0)
+
+    def test_future_dated_initial_baseline_is_never_promoted_on_later_refresh(self) -> None:
+        future_date = "Wed, 26 Nov 2026 00:00:00 +0000"
+        future = episode("future-baseline", future_date)
+
+        class Clock(datetime):
+            current = datetime(2026, 11, 25, 12, tzinfo=timezone.utc)
+
+            @classmethod
+            def now(cls, tz=None):
+                return cls.current if tz is not None else cls.current.replace(tzinfo=None)
+
+        with self.parse_records([future]), patch.object(backend, "datetime", Clock):
+            # Feed registration stores all currently listed episodes as baseline.
+            result = backend.add_feed(backend.FeedInput(url="https://example.test/future-baseline.xml"))
+            baseline_id = result["id"]
+            with backend.db() as conn:
+                baseline_episode = conn.execute("SELECT id,auto_eligible,transcript_status FROM episodes WHERE feed_id=?", (baseline_id,)).fetchone()
+            self.assertEqual(baseline_episode["auto_eligible"], 0)
+
+            Clock.current = datetime(2026, 11, 26, 0, 1, tzinfo=timezone.utc)
+            backend.refresh_feed_internal(baseline_id)
+
+        with backend.db() as conn:
+            row = conn.execute("SELECT auto_eligible,transcript_status FROM episodes WHERE id=?", (baseline_episode["id"],)).fetchone()
+        self.assertEqual((row["auto_eligible"], row["transcript_status"]), (0, "none"))
+        self.executor.submit.assert_not_called()
+
+    def test_future_negative_zero_date_is_eligible_and_rechecked_at_publication(self) -> None:
+        future_date = "Tue, 25 Nov 2026 00:00:00 -0000"
+
+        class Clock(datetime):
+            current = datetime(2026, 11, 24, 12, tzinfo=timezone.utc)
+
+            @classmethod
+            def now(cls, tz=None):
+                return cls.current if tz is not None else cls.current.replace(tzinfo=None)
+
+        with backend.db() as conn:
+            conn.execute("UPDATE feeds SET auto_since=? WHERE id=?", ("2026-11-23T00:00:00+00:00", self.feed_id))
+        with self.parse_records([episode("future-negative-zero", future_date)]), patch.object(backend, "datetime", Clock):
+            backend.refresh_feed_internal(self.feed_id)
+            row = self.rows()[0]
+            self.assertEqual((row["auto_eligible"], row["transcript_status"]), (1, "none"))
+            self.assertEqual(self.executor.submit.call_count, 0)
+
+            Clock.current = datetime(2026, 11, 25, 0, 1, tzinfo=timezone.utc)
+            backend.refresh_feed_internal(self.feed_id)
+
+        self.assertEqual(self.rows()[0]["transcript_status"], "queued")
+        self.assertEqual(self.executor.submit.call_count, 1)
+
+    def test_recovery_never_changes_pre_activation_or_non_none_statuses(self) -> None:
+        after_activation = "Tue, 24 Nov 2026 00:00:00 -0000"
+        before_activation = "Tue, 22 Nov 2026 00:00:00 -0000"
+        with backend.db() as conn:
+            conn.execute("UPDATE feeds SET auto_since=? WHERE id=?", ("2026-11-23T00:00:00+00:00", self.feed_id))
+            for guid, status, published in [
+                ("ready", "ready", after_activation),
+                ("queued", "queued", after_activation),
+                ("processing", "processing", after_activation),
+                ("failed", "error", after_activation),
+                ("old", "none", before_activation),
+            ]:
+                conn.execute(
+                    "INSERT INTO episodes(feed_id,guid,title,audio_url,publication_time,transcript_status) VALUES(?,?,?,?,?,?)",
+                    (self.feed_id, guid, guid, f"https://example.test/{guid}.mp3", published, status),
+                )
+        records = [episode(guid, when) for guid, when in [
+            ("ready", after_activation), ("queued", after_activation),
+            ("processing", after_activation), ("failed", after_activation),
+            ("old", before_activation),
+        ]]
+        with self.parse_records(records):
+            backend.refresh_feed_internal(self.feed_id)
+        rows = {row["guid"]: row for row in self.rows()}
+        for guid, status in [("ready", "ready"), ("queued", "queued"), ("processing", "processing"), ("failed", "error"), ("old", "none")]:
+            self.assertEqual(rows[guid]["transcript_status"], status)
+            self.assertEqual(rows[guid]["auto_eligible"], 0)
+        self.executor.submit.assert_not_called()
+
     def insert_legacy_feed(self, url: str, published: str) -> int:
         """Create a pre-feature feed with a publication date older than migration time."""
         with backend.db() as conn:

@@ -269,12 +269,21 @@ def refresh_feed(feed_id: int) -> dict[str, int]:
 def _published_time(value: str) -> datetime | None:
     """Parse RSS/Atom publication timestamps; unknown values are ineligible."""
     if not value or not value.strip(): return None
+    value = value.strip()
     try:
-        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
-        try: parsed = parsedate_to_datetime(value.strip())
+        try: parsed = parsedate_to_datetime(value)
         except (TypeError, ValueError, OverflowError): return None
-    if parsed is None or parsed.tzinfo is None: return None
+    if parsed is None: return None
+    # RFC 5322 uses -0000 to mean UTC with an unknown originating timezone.
+    # email.utils returns a naive datetime for this specific offset. Attach UTC
+    # only after successful parsing and only for that explicit suffix; genuinely
+    # timezone-less dates remain ineligible.
+    if parsed.tzinfo is None:
+        if re.search(r"\s-0000$", value) is None:
+            return None
+        parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
 
 def refresh_feed_internal(feed_id: int, auto_queue: bool = True) -> int:
@@ -291,11 +300,13 @@ def refresh_feed_internal(feed_id: int, auto_queue: bool = True) -> int:
             # Insert in feed order expected by the API (newest rows get largest ids).
             for e in reversed(eps):
                 cur = c.execute("INSERT OR IGNORE INTO episodes(feed_id,guid,title,description,audio_url,published_at,duration,publication_time) VALUES(?,?,?,?,?,?,?,?)", (feed_id,e["guid"],e["title"],e["description"],e["audio_url"],e["published_at"],e["duration"],e["publication_time"]))
+                # Only an episode discovered after feed activation is known to
+                # be new. Older rows with auto_eligible=0 may be baseline items,
+                # so do not infer provenance from their publication dates.
                 if cur.rowcount and auto_queue and activation is not None:
                     published = _published_time(e["publication_time"])
                     if published is not None and published >= activation:
-                        eid = cur.lastrowid
-                        c.execute("UPDATE episodes SET auto_eligible=1 WHERE id=?", (eid,))
+                        c.execute("UPDATE episodes SET auto_eligible=1 WHERE id=? AND transcript_status='none'", (cur.lastrowid,))
             if auto_queue and activation is not None:
                 candidates = c.execute("SELECT id,publication_time FROM episodes WHERE feed_id=? AND auto_eligible=1 AND transcript_status='none'", (feed_id,)).fetchall()
                 for candidate in candidates:
