@@ -144,7 +144,10 @@ class PlayerAcceptanceTest(unittest.TestCase):
             elif path == "/api/episodes/101/translations/0" and method == "POST":
                 translation_requests.append(path)
                 self.assertEqual(request.post_data_json, {"expected_source_fingerprint": "a" * 64})
-                route.fulfill(json={"translation": "架空の短い文です。", "cached": False, "target_language": "ja", "source_fingerprint": "a" * 64})
+                if len(translation_requests) == 1:
+                    route.fulfill(json={"translation": "架空の短い文です。", "expressions": [], "expressions_ready": False, "explanation_error": "Translation is unavailable.", "cached": True, "target_language": "ja", "source_fingerprint": "a" * 64})
+                else:
+                    route.fulfill(json={"translation": "架空の短い文です。", "expressions": [{"phrase": "short sentence", "explanation": "短い文という意味です。<img src=x onerror=alert(1)>"}], "expressions_ready": True, "cached": True, "target_language": "ja", "source_fingerprint": "a" * 64})
             elif path == "/api/episodes/101/translations/1" and method == "POST":
                 translation_requests.append(path)
                 self.assertEqual(request.post_data_json, {"expected_source_fingerprint": "b" * 64})
@@ -167,6 +170,9 @@ class PlayerAcceptanceTest(unittest.TestCase):
             )
             page = browser.new_page(viewport={"width": 390, "height": 844}, is_mobile=True, has_touch=True)
             page.set_default_timeout(5000)
+            page.add_init_script("""() => localStorage.setItem('linguacast-translations-101', JSON.stringify({
+              0: {source_fingerprint: 'a'.repeat(64), translation: 'Legacy cached translation.', expressions: [null]}
+            }))""")
             page.add_init_script("""window.__mediaActions = {}; Object.defineProperty(navigator, 'mediaSession', {configurable: true, value: {setActionHandler: (name, handler) => { window.__mediaActions[name] = handler; }, setPositionState: () => {}, set metadata(value) {}, set playbackState(value) {}}});""")
             page.route("**/api/**", fulfill_api)
             errors: list[str] = []
@@ -269,10 +275,22 @@ class PlayerAcceptanceTest(unittest.TestCase):
                 self.assertAlmostEqual(repeat_box_after["y"], repeat_box_before["y"], delta=1, msg="sentence action row should stay in place")
                 self.assertEqual(translation_toggle.get_attribute("aria-expanded"), "true")
                 self.assertAlmostEqual(page.locator("#audio").evaluate("audio => audio.currentTime"), time_before_translation, delta=0.05)
+                page.get_by_text("Translation is unavailable.", exact=True).wait_for()
                 translation_toggle.click()
                 self.assertFalse(translation_panel.is_visible())
                 self.assertEqual(translation_toggle.get_attribute("aria-expanded"), "false")
                 self.assertEqual(len(translation_requests), 1, "the translation is requested only on first reveal")
+                translation_toggle.click()
+                self.assertTrue(translation_panel.is_visible(), "a saved translation remains showable after note generation fails")
+                self.assertEqual(len(translation_requests), 1, "showing a saved translation does not retry expression generation")
+                page.locator("#translation-0 [data-translation-retry]").click()
+                page.locator("#translation-0 .expression-note strong").wait_for()
+                self.assertEqual(len(translation_requests), 2, "expression notes have an explicit retry action")
+                self.assertEqual(page.locator("#translation-0 .expression-note strong").inner_text(), "short sentence")
+                self.assertEqual(page.locator("#translation-0 .expression-note img").count(), 0, "model output must be escaped, not inserted as markup")
+                self.assertIn("<img src=x onerror=alert(1)>", page.locator("#translation-0 .expression-note span").inner_text())
+                translation_toggle.click()
+                self.assertFalse(translation_panel.is_visible())
                 self.assertAlmostEqual(page.locator("#audio").evaluate("audio => audio.currentTime"), time_before_translation, delta=0.05)
 
                 # A 409 offers transcript refresh. The refresh rerenders the
@@ -293,7 +311,15 @@ class PlayerAcceptanceTest(unittest.TestCase):
                 translation_toggle.click()
                 self.assertTrue(translation_panel.is_visible(), "the first post-refresh click should expand the cached translation")
                 self.assertEqual(translation_toggle.inner_text(), "Hide Japanese")
-                self.assertEqual(translation_requests.count("/api/episodes/101/translations/0"), 1, "reopening cached translation should not POST again")
+                self.assertEqual(translation_requests.count("/api/episodes/101/translations/0"), 2, "reopening cached translation should not POST again")
+
+                page.locator("#player-back").click()
+                page.locator('[data-feed-id="10"]').click()
+                page.locator('[data-episode-id="101"]').click()
+                page.locator(".transcript-line").first.wait_for()
+                page.locator('.translation-toggle[data-translation-line="0"]').click()
+                self.assertEqual(page.locator("#translation-0 .expression-note strong").inner_text(), "short sentence", "saved expression notes should survive reopening the episode")
+                self.assertEqual(translation_requests.count("/api/episodes/101/translations/0"), 2, "reopening must reuse saved translation notes")
 
                 # A sentence loop must wrap to the selected sentence boundary
                 # and remain active across the boundary.
@@ -384,7 +410,7 @@ class PlayerAcceptanceTest(unittest.TestCase):
                 self.assertEqual(route.request.post_data_json, {"expected_source_fingerprint": fingerprint})
                 request_started.set()
                 await release_response.wait()
-                await route.fulfill(json={"translation": "待機中のテスト訳です。", "cached": False, "target_language": "ja", "source_fingerprint": fingerprint})
+                await route.fulfill(json={"translation": "待機中のテスト訳です。", "expressions": [], "expressions_ready": True, "cached": False, "target_language": "ja", "source_fingerprint": fingerprint})
             elif path.endswith("/audio"):
                 await route.fulfill(body=self.audio_bytes, content_type="audio/wav")
             else:

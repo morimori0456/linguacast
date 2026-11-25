@@ -265,6 +265,57 @@ class TranslationRunnerTest(unittest.TestCase):
             with self.subTest(payload=payload), self.assertRaises(runner.TranslationRunnerError):
                 runner._extract_batch_translations(event, 2)
 
+    def test_expression_batch_accepts_exact_source_phrases_and_empty_notes(self) -> None:
+        sentences = ["We need to get the ball rolling.", "The sky is blue."]
+        payload = {"translations": [
+            {"index": 0, "translation": "まず始める必要があります。", "expressions": [
+                {"phrase": "get the ball rolling", "explanation": "物事を始めるという表現です。"}
+            ]},
+            {"index": 1, "translation": "空は青いです。", "expressions": []},
+        ]}
+        event = json.dumps({"event": "result", "result": {
+            "status": "SUCCESS", "response": json.dumps(payload, ensure_ascii=False),
+        }}, ensure_ascii=False).encode() + b"\n"
+        results = runner._extract_batch_results(event, sentences)
+        self.assertEqual(results[0]["expressions"][0]["phrase"], "get the ball rolling")
+        self.assertEqual(results[1]["expressions"], [])
+
+    def test_expression_batch_invocation_sends_sentences_and_parses_notes(self) -> None:
+        sentence = "They finally broke the ice."
+        body = json.dumps({"translations": [{
+            "index": 0,
+            "translation": "彼らはついに緊張をほぐしました。",
+            "expressions": [{"phrase": "broke the ice", "explanation": "場の緊張をほぐす表現です。"}],
+        }]}, ensure_ascii=False)
+        fake = self.fake_agy(output=(json.dumps({"event": "result", "result": {
+            "status": "SUCCESS", "response": body,
+        }}, ensure_ascii=False) + "\n"))
+        with patch.object(runner.Path, "home", return_value=self.safe_user_home):
+            results = runner.translate_sentences_with_expressions([sentence], executable=str(fake))
+        self.assertEqual(results, [{"translation": "彼らはついに緊張をほぐしました。", "expressions": [
+            {"phrase": "broke the ice", "explanation": "場の緊張をほぐす表現です。"}
+        ]}])
+        details = json.loads(self.record.read_text(encoding="utf-8"))
+        self.assertIn(sentence, details["stdin"])
+        self.assertNotIn(sentence, json.dumps(details["argv"], ensure_ascii=False))
+
+    def test_expression_batch_rejects_unmatched_duplicate_and_oversized_notes(self) -> None:
+        sentence = "We need to get the ball rolling."
+        invalid_expressions = [
+            [{"phrase": "kick off the project", "explanation": "始めることです。"}],
+            [{"phrase": "get the ball rolling", "explanation": "最初です。"},
+             {"phrase": "get the ball rolling", "explanation": "重複です。"}],
+            [{"phrase": "get the ball rolling", "explanation": "解説" * 100}],
+            [{"phrase": "get the ball rolling", "explanation": "よい表現です。", "extra": "no"}],
+        ]
+        for expressions in invalid_expressions:
+            payload = {"translations": [{"index": 0, "translation": "始めましょう。", "expressions": expressions}]}
+            event = json.dumps({"event": "result", "result": {
+                "status": "SUCCESS", "response": json.dumps(payload, ensure_ascii=False),
+            }}, ensure_ascii=False).encode() + b"\n"
+            with self.subTest(expressions=expressions), self.assertRaises(runner.TranslationRunnerError):
+                runner._extract_batch_results(event, [sentence])
+
     def test_batch_bounds_input_count_and_total_characters(self) -> None:
         with self.assertRaises(runner.TranslationRunnerError):
             runner.translate_sentences(["x"] * (runner.MAX_BATCH_SENTENCES + 1), executable="/bin/true")
