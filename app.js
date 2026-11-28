@@ -7,8 +7,9 @@ function readSkipInterval(key, fallback) {
     return Number.isInteger(value) && value >= SKIP_INTERVAL_MIN && value <= SKIP_INTERVAL_MAX ? value : fallback;
   } catch { return fallback; }
 }
-const state = { feeds: [], episodes: [], feedId: null, episode: null, segments: [], translations: {}, translationRequests: new Set(), activeLine: -1, loopLine: -1, rewindSeconds: readSkipInterval('linguacast-rewind-seconds', 10), forwardSeconds: readSkipInterval('linguacast-forward-seconds', 30), speeds: [0.5, 0.75, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2], speedIndex: 3, pollTimer: null, translationPrefetchTimer: null, toastTimer: null, followPlayback: true, touchStartY: null, touchStartTarget: null, seekDragging: false, lastPositionSaveAt: 0, lastSavedPosition: 0, lastMediaPositionAt: 0, switchingEpisode: false, episodeRequestId: 0, episodeLoading: false, positionReady: false, metadataRestoreHandler: null, metadataErrorHandler: null };
+const state = { feeds: [], episodes: [], feedId: null, episode: null, segments: [], translations: {}, translationRequests: new Set(), activeLine: -1, loopLine: -1, shadowTake: null, shadowRecording: null, shadowPending: null, shadowPlayback: null, rewindSeconds: readSkipInterval('linguacast-rewind-seconds', 10), forwardSeconds: readSkipInterval('linguacast-forward-seconds', 30), speeds: [0.5, 0.75, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2], speedIndex: 3, pollTimer: null, translationPrefetchTimer: null, toastTimer: null, followPlayback: true, touchStartY: null, touchStartTarget: null, seekDragging: false, lastPositionSaveAt: 0, lastSavedPosition: 0, lastMediaPositionAt: 0, switchingEpisode: false, episodeRequestId: 0, episodeLoading: false, positionReady: false, metadataRestoreHandler: null, metadataErrorHandler: null };
 const audio = $('#audio');
+const shadowTakeAudio = $('#shadow-take-audio');
 try {
   const savedRate = Number(localStorage.getItem('linguacast-playback-rate'));
   const savedRateIndex = state.speeds.indexOf(savedRate);
@@ -56,6 +57,267 @@ function seekBy(offset) {
   const duration = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : Infinity;
   audio.currentTime = Math.max(0, Math.min(duration, audio.currentTime + offset));
   savePosition(true);
+}
+const SHADOW_OFFSET_STEP_MS = 100;
+const SHADOW_OFFSET_LIMIT_MS = 1500;
+const SHADOW_MAX_SENTENCE_SECONDS = 60;
+const SHADOW_RECORDING_TAIL_MS = 30_000;
+const SHADOW_MAX_RECORDING_BYTES = 25 * 1024 * 1024;
+function shadowSegment(index) {
+  const segment = state.segments[index];
+  if (!segment || !Number.isFinite(Number(segment.start)) || !Number.isFinite(Number(segment.end))) return null;
+  const start = Number(segment.start), end = Number(segment.end);
+  if (start < 0 || end <= start) return null;
+  return { start, end, fingerprint: segment.source_fingerprint || `${start}:${end}:${segment.text || ''}` };
+}
+function shadowTakeFor(index) {
+  const segment = shadowSegment(index);
+  return segment && state.shadowTake && state.shadowTake.episodeId === String(idOf(state.episode))
+    && state.shadowTake.fingerprint === segment.fingerprint ? state.shadowTake : null;
+}
+function updateShadowUI(index) {
+  const line = document.querySelector(`.transcript-line[data-line="${index}"]`);
+  if (!line) return;
+  const panel = line.querySelector('.shadow-panel');
+  const opener = line.querySelector('.shadow-open');
+  const recorder = state.shadowRecording?.index === index ? state.shadowRecording : null;
+  const pending = state.shadowPending?.index === index;
+  const busy = Boolean(state.shadowPending || state.shadowRecording);
+  const take = shadowTakeFor(index);
+  const recordButton = panel.querySelector('.shadow-record');
+  const stopButton = panel.querySelector('.shadow-stop');
+  const status = panel.querySelector('.shadow-status');
+  opener.setAttribute('aria-expanded', String(!panel.hidden));
+  opener.classList.toggle('has-take', Boolean(take));
+  recordButton.disabled = Boolean(state.shadowPending || (state.shadowRecording && !recorder));
+  if (pending) recordButton.textContent = 'Allow microphone…';
+  else recordButton.textContent = take ? 'Record again' : 'Record';
+  recordButton.hidden = Boolean(recorder);
+  stopButton.hidden = !recorder;
+  stopButton.disabled = !recorder;
+  panel.querySelectorAll('[data-shadow-mode]').forEach((button) => { button.disabled = !take || busy; });
+  panel.querySelectorAll('[data-shadow-offset]').forEach((button) => { button.disabled = !take || busy; });
+  const offset = take?.offsetMs || 0;
+  panel.querySelector('.shadow-offset-value').textContent = `${offset < 0 ? '−' : '+'}${(Math.abs(offset) / 1000).toFixed(1)} s`;
+  const playing = state.shadowPlayback?.index === index ? state.shadowPlayback.mode : '';
+  panel.querySelectorAll('[data-shadow-mode]').forEach((button) => button.setAttribute('aria-pressed', String(button.dataset.shadowMode === playing)));
+  if (pending) status.textContent = 'Waiting for microphone permission…';
+  else if (recorder) status.textContent = recorder.waitingForSpeechEnd
+    ? 'Original finished. Finish speaking, then tap Stop.' : 'Recording with the original…';
+  else if (take) status.textContent = 'Take ready. Kept in memory until you close this player.';
+  else status.textContent = 'Record this sentence along with the original.';
+  status.classList.toggle('recording', Boolean(recorder));
+}
+function updateAllShadowUI() {
+  document.querySelectorAll('.transcript-line[data-line]').forEach((line) => updateShadowUI(Number(line.dataset.line)));
+}
+function stopShadowPlayback(pauseOriginal = true) {
+  const playback = state.shadowPlayback;
+  if (playback?.delayTimer) clearTimeout(playback.delayTimer);
+  state.shadowPlayback = null;
+  shadowTakeAudio.pause();
+  if (playback?.delayedElement && playback.savedDelayedRate) playback.delayedElement.playbackRate = playback.savedDelayedRate;
+  shadowTakeAudio.currentTime = 0;
+  shadowTakeAudio.muted = false;
+  audio.muted = false;
+  if (playback) audio.playbackRate = state.speeds[state.speedIndex];
+  if (pauseOriginal) audio.pause();
+  if (playback) updateShadowUI(playback.index);
+}
+function stopShadowStream(recording) {
+  if (recording.stopTimer) clearTimeout(recording.stopTimer);
+  if (recording.monitorFrame !== null) cancelAnimationFrame(recording.monitorFrame);
+  recording.stream?.getTracks().forEach((track) => track.stop());
+}
+function clearShadowTimers(recording) {
+  if (recording.stopTimer) clearTimeout(recording.stopTimer);
+  if (recording.monitorFrame !== null) cancelAnimationFrame(recording.monitorFrame);
+  recording.stopTimer = null;
+  recording.monitorFrame = null;
+}
+function cancelShadowRecording() {
+  const recording = state.shadowRecording;
+  if (!recording) return;
+  recording.cancelled = true;
+  state.shadowRecording = null;
+  clearShadowTimers(recording);
+  if (recording.recorder.state !== 'inactive') {
+    try { recording.recorder.stop(); } catch { /* The stream may already have stopped. */ }
+  }
+  recording.stream?.getTracks().forEach((track) => track.stop());
+  if (recording.index !== undefined) updateShadowUI(recording.index);
+}
+function clearShadowSession() {
+  if (state.shadowPending) { state.shadowPending.cancelled = true; state.shadowPending = null; }
+  stopShadowPlayback(true);
+  cancelShadowRecording();
+  if (state.shadowTake?.url) URL.revokeObjectURL(state.shadowTake.url);
+  state.shadowTake = null;
+  updateAllShadowUI();
+}
+function chooseShadowMimeType() {
+  if (!window.MediaRecorder || typeof window.MediaRecorder.isTypeSupported !== 'function') return '';
+  return ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus']
+    .find((type) => window.MediaRecorder.isTypeSupported(type)) || '';
+}
+async function startShadowRecording(index) {
+  const segment = shadowSegment(index);
+  if (!segment || !state.episode) { showToast('This sentence cannot be recorded.'); return; }
+  if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+    showToast('Microphone recording is not supported in this browser.'); return;
+  }
+  if (segment.end - segment.start > SHADOW_MAX_SENTENCE_SECONDS) { showToast('This sentence is too long to record.'); return; }
+  if (state.shadowPending) return;
+  if (state.shadowRecording) cancelShadowRecording();
+  stopShadowPlayback(true);
+  const episodeId = String(idOf(state.episode));
+  const requestId = state.episodeRequestId;
+  const pending = { index, episodeId, requestId, fingerprint: segment.fingerprint, cancelled: false };
+  state.shadowPending = pending;
+  updateShadowUI(index);
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+    if (pending.cancelled || state.shadowPending !== pending || requestId !== state.episodeRequestId || String(idOf(state.episode)) !== episodeId
+        || shadowSegment(index)?.fingerprint !== segment.fingerprint) {
+      stream.getTracks().forEach((track) => track.stop()); return;
+    }
+    const mimeType = chooseShadowMimeType();
+    const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+    const playbackRate = Math.max(0.5, Number(audio.playbackRate) || 1);
+    const maxRecordingMs = Math.ceil((segment.end - segment.start) / playbackRate * 1000) + SHADOW_RECORDING_TAIL_MS;
+    const recording = { index, episodeId, fingerprint: segment.fingerprint, segment, stream, recorder, request: pending, playbackRate,
+      chunks: [], stopTimer: null, monitorFrame: null, waitingForSpeechEnd: false, cancelled: false };
+    state.shadowRecording = recording;
+    state.shadowPending = null;
+    recorder.addEventListener('dataavailable', (event) => { if (event.data?.size) recording.chunks.push(event.data); });
+    recorder.addEventListener('error', () => {
+      if (state.shadowRecording !== recording) return;
+      cancelShadowRecording(); showToast('Recording failed. Please try again.');
+    }, { once: true });
+    recorder.addEventListener('stop', () => {
+      stopShadowStream(recording);
+      if (state.shadowRecording === recording) state.shadowRecording = null;
+      if (!recording.cancelled && recording.chunks.length && requestId === state.episodeRequestId
+          && String(idOf(state.episode)) === episodeId && shadowSegment(index)?.fingerprint === segment.fingerprint) {
+        const blob = new Blob(recording.chunks, { type: recorder.mimeType || recording.chunks[0].type || 'audio/mp4' });
+        if (blob.size > SHADOW_MAX_RECORDING_BYTES) {
+          showToast('Recording is too large. Please record a shorter take.');
+        } else {
+          if (state.shadowTake?.url) URL.revokeObjectURL(state.shadowTake.url);
+          state.shadowTake = { episodeId, fingerprint: segment.fingerprint, index, blob, url: URL.createObjectURL(blob), offsetMs: 0, playbackRate };
+        }
+      }
+      if (state.shadowRecording !== recording) updateShadowUI(index);
+    }, { once: true });
+    recorder.start();
+    audio.currentTime = segment.start;
+    await audio.play();
+    const monitor = () => {
+      if (state.shadowRecording !== recording || recording.waitingForSpeechEnd) return;
+      if (audio.currentTime >= segment.end) {
+        audio.pause();
+        recording.waitingForSpeechEnd = true;
+        updateShadowUI(index);
+        return;
+      }
+      recording.monitorFrame = requestAnimationFrame(monitor);
+    };
+    recording.monitorFrame = requestAnimationFrame(monitor);
+    recording.stopTimer = setTimeout(() => {
+      if (state.shadowRecording === recording) finishShadowRecording(index);
+    }, maxRecordingMs);
+    updateShadowUI(index);
+  } catch (error) {
+    stream?.getTracks().forEach((track) => track.stop());
+    const ownsPending = state.shadowPending === pending;
+    const ownsRecording = state.shadowRecording?.request === pending;
+    if (pending.cancelled || (!ownsPending && !ownsRecording)) return;
+    if (ownsPending) state.shadowPending = null;
+    if (ownsRecording) cancelShadowRecording();
+    stopShadowPlayback(true);
+    showToast(error?.name === 'NotAllowedError' ? 'Allow microphone access to record.' : 'Could not start recording. Try again.');
+    updateShadowUI(index);
+  }
+}
+function finishShadowRecording(index) {
+  const recording = state.shadowRecording;
+  if (!recording || recording.index !== index || recording.recorder.state === 'inactive') return;
+  clearShadowTimers(recording);
+  audio.pause();
+  try { recording.recorder.stop(); }
+  catch { cancelShadowRecording(); showToast('Could not finish recording.'); }
+  updateShadowUI(index);
+}
+function playShadowMode(index, mode) {
+  if (state.shadowPending || state.shadowRecording) { showToast('Finish or cancel recording before playback.'); return; }
+  const take = shadowTakeFor(index);
+  const segment = shadowSegment(index);
+  if (!segment) { showToast('This sentence cannot be played.'); return; }
+  if (mode !== 'original' && !take) { showToast('Record this sentence first.'); return; }
+  stopShadowPlayback(true);
+  if (mode === 'original') {
+    const playback = { index, mode, segment, singlePass: true };
+    state.shadowPlayback = playback;
+    audio.playbackRate = take?.playbackRate || audio.playbackRate;
+    activateLine(index);
+    audio.currentTime = segment.start;
+    audio.play().catch(() => { if (state.shadowPlayback !== playback) return; stopShadowPlayback(false); showToast('Could not play the original audio.'); });
+    updateShadowUI(index);
+    return;
+  }
+  shadowTakeAudio.src = take.url;
+  shadowTakeAudio.currentTime = 0;
+  if (mode === 'take') {
+    const playback = { index, mode, segment, singlePass: false };
+    state.shadowPlayback = playback;
+    audio.pause();
+    shadowTakeAudio.play().catch(() => { if (state.shadowPlayback !== playback) return; stopShadowPlayback(false); showToast('Could not play your recording.'); });
+    updateShadowUI(index);
+    return;
+  }
+  const offsetMs = take.offsetMs || 0;
+  const delay = Math.abs(offsetMs);
+  const delayedElement = offsetMs > 0 ? shadowTakeAudio : audio;
+  const playback = { index, mode, segment, singlePass: true, delayTimer: null, delayPending: delay > 0, sourceEnded: false, takeEnded: false };
+  state.shadowPlayback = playback;
+  audio.playbackRate = take.playbackRate || audio.playbackRate;
+  audio.currentTime = segment.start;
+  if (delay > 0) {
+    delayedElement.muted = true;
+    playback.delayedElement = delayedElement;
+    playback.savedDelayedRate = delayedElement.playbackRate;
+    // Keep the prewarmed, muted track alive until its offset expires, even
+    // when the sentence itself is shorter than the selected offset.
+    delayedElement.playbackRate = Math.min(playback.savedDelayedRate, 0.0625);
+  }
+  const startOriginal = audio.play();
+  const startTake = shadowTakeAudio.play();
+  Promise.all([startOriginal, startTake]).then(() => {
+    if (state.shadowPlayback !== playback) return;
+    if (delay > 0) playback.delayTimer = setTimeout(() => {
+      if (state.shadowPlayback !== playback) return;
+      playback.delayTimer = null;
+      playback.delayPending = false;
+      playback.takeEnded = false;
+      if (delayedElement === shadowTakeAudio) shadowTakeAudio.currentTime = 0;
+      else { audio.currentTime = segment.start; playback.sourceEnded = false; }
+      delayedElement.playbackRate = playback.savedDelayedRate;
+      delayedElement.muted = false;
+      if (delayedElement.paused) delayedElement.play().catch(() => {
+        if (state.shadowPlayback !== playback) return;
+        stopShadowPlayback(true); showToast('The delayed track could not resume. Tap to try again.');
+      });
+    }, delay);
+  }).catch(() => { if (state.shadowPlayback !== playback) return; stopShadowPlayback(true); showToast('Could not play both tracks. Tap to try again.'); });
+  updateShadowUI(index);
+}
+function adjustShadowOffset(index, direction) {
+  const take = shadowTakeFor(index);
+  if (!take) return;
+  stopShadowPlayback(true);
+  take.offsetMs = Math.max(-SHADOW_OFFSET_LIMIT_MS, Math.min(SHADOW_OFFSET_LIMIT_MS, take.offsetMs + direction * SHADOW_OFFSET_STEP_MS));
+  updateShadowUI(index);
 }
 const idOf = (item) => item.id ?? item.feed_id ?? item.episode_id;
 const titleOf = (item) => item.title || item.name || 'Untitled';
@@ -322,6 +584,7 @@ async function refreshTranscriptForTranslation(index) {
 
 async function openEpisode(episodeId) {
   const requestId = ++state.episodeRequestId;
+  if (state.episode && String(idOf(state.episode)) !== String(episodeId)) clearShadowSession();
   state.episodeLoading = true;
   $('#transcribe-button').disabled = true;
   clearInterval(state.pollTimer); state.pollTimer = null;
@@ -410,7 +673,7 @@ function renderTranscript() {
     if (!words.length) wordsHTML = `<span class="word" data-line="${index}" data-word="0" data-start="${start}" data-end="${end}">${wordsHTML}</span>`;
     const cached = translationEntry(index);
     const translationHTML = cached?.translation ? escapeHTML(cached.translation) : cached?.error ? escapeHTML(cached.error) : '';
-    return `<article class="transcript-line" data-line="${index}" data-start="${start}" data-end="${end}"><div class="sentence-toolbar"><button type="button" class="line-time" data-play-line="${index}" aria-label="Play from ${fmtTime(start)}">${fmtTime(start)}</button><button type="button" class="translation-toggle" data-translation-line="${index}" aria-expanded="false" aria-controls="translation-${index}">Show Japanese</button><button class="line-loop" data-loop-line="${index}" aria-label="Repeat this sentence" aria-pressed="false">↻</button></div><div class="line-text">${wordsHTML}</div><div id="translation-${index}" class="translation-content" aria-live="polite" hidden><div class="translation-ja">${translationHTML}</div><div class="expression-notes" hidden></div><button type="button" class="expression-retry" data-translation-retry="${index}" hidden>Retry expression notes</button></div></article>`;
+    return `<article class="transcript-line" data-line="${index}" data-start="${start}" data-end="${end}"><div class="sentence-toolbar"><button type="button" class="line-time" data-play-line="${index}" aria-label="Play from ${fmtTime(start)}">${fmtTime(start)}</button><button type="button" class="translation-toggle" data-translation-line="${index}" aria-expanded="false" aria-controls="translation-${index}">Show Japanese</button><button class="line-loop" data-loop-line="${index}" aria-label="Repeat this sentence" aria-pressed="false">↻</button><button class="shadow-open" type="button" data-shadow-open="${index}" aria-label="Practice this sentence" aria-expanded="false" aria-controls="shadow-panel-${index}" title="Record this sentence">🎙</button></div><div class="line-text">${wordsHTML}</div><div id="translation-${index}" class="translation-content" aria-live="polite" hidden><div class="translation-ja">${translationHTML}</div><div class="expression-notes" hidden></div><button type="button" class="expression-retry" data-translation-retry="${index}" hidden>Retry expression notes</button></div><section class="shadow-panel" id="shadow-panel-${index}" aria-label="Shadow this sentence" hidden><div class="shadow-actions"><button type="button" class="shadow-record" data-shadow-record="${index}">Record</button><button type="button" class="shadow-stop" data-shadow-stop="${index}" hidden>Stop recording</button><button type="button" data-shadow-mode="original" data-shadow-index="${index}">Original</button><button type="button" data-shadow-mode="take" data-shadow-index="${index}" disabled>My recording</button><button type="button" data-shadow-mode="both" data-shadow-index="${index}" disabled>Play together</button></div><div class="shadow-offset"><span>Recording start</span><button type="button" data-shadow-offset="-1" data-shadow-index="${index}" aria-label="Start recording 0.1 seconds earlier" disabled>−0.1</button><span class="shadow-offset-value">+0.0 s</span><button type="button" data-shadow-offset="1" data-shadow-index="${index}" aria-label="Start recording 0.1 seconds later" disabled>+0.1</button></div><p class="shadow-status" role="status" aria-live="polite">Record this sentence along with the original.</p><p class="shadow-hint">Use headphones for best results. This take stays in memory until you close the player.</p></section></article>`;
   }).join('');
   state.segments.forEach((_, index) => updateTranslationUI(index));
 }
@@ -562,7 +825,20 @@ function updatePlayer() {
   $('#seek').setAttribute('aria-valuetext', `${fmtTime(seekPosition)} / ${fmtTime(duration)}`);
   updatePlayButton();
   savePosition(); updateMediaPosition();
-  if (state.loopLine >= 0) {
+  if (state.shadowRecording && !state.shadowRecording.waitingForSpeechEnd
+      && audio.currentTime >= state.shadowRecording.segment.end) {
+    audio.pause();
+    state.shadowRecording.waitingForSpeechEnd = true;
+    updateShadowUI(state.shadowRecording.index);
+  }
+  if (state.shadowPlayback?.singlePass && !state.shadowPlayback.sourceEnded
+      && audio.currentTime >= state.shadowPlayback.segment.end) {
+    audio.pause();
+    state.shadowPlayback.sourceEnded = true;
+    if (state.shadowPlayback.mode === 'original') stopShadowPlayback(false);
+    else if (state.shadowPlayback.takeEnded) stopShadowPlayback(false);
+  }
+  if (!state.shadowRecording && !state.shadowPlayback && state.loopLine >= 0) {
     const loop = state.segments[state.loopLine];
     if (loop && audio.currentTime >= Number(loop.end)) audio.currentTime = Number(loop.start) || 0;
   }
@@ -626,22 +902,46 @@ $('#add-feed-form').addEventListener('submit', async (event) => {
 $('#feed-list').addEventListener('click', (event) => { const card = event.target.closest('[data-feed-id]'); if (card) openFeed(card.dataset.feedId); });
 $('#episode-list').addEventListener('click', (event) => { const button = event.target.closest('[data-episode-id]'); if (button) openEpisode(button.dataset.episodeId); });
 $('#back-to-shows').addEventListener('click', () => { $('#episode-section').hidden = true; window.scrollTo({ top: 0, behavior: 'smooth' }); });
-$('#player-back').addEventListener('click', () => { state.episodeRequestId += 1; state.episodeLoading = false; $('#transcribe-button').disabled = false; clearInterval(state.pollTimer); state.pollTimer = null; clearInterval(state.translationPrefetchTimer); state.translationPrefetchTimer = null; audio.pause(); $('#player-view').hidden = true; $('#home-view').hidden = false; });
+$('#player-back').addEventListener('click', () => { clearShadowSession(); state.episodeRequestId += 1; state.episodeLoading = false; $('#transcribe-button').disabled = false; clearInterval(state.pollTimer); state.pollTimer = null; clearInterval(state.translationPrefetchTimer); state.translationPrefetchTimer = null; audio.pause(); $('#player-view').hidden = true; $('#home-view').hidden = false; });
 $('#transcribe-button').addEventListener('click', startTranscription);
 $('#follow-playback').addEventListener('click', () => setPlaybackFollow(true));
 $('#transcript-lines').addEventListener('click', (event) => {
+  const shadowOpen = event.target.closest('[data-shadow-open]');
+  if (shadowOpen) {
+    const index = Number(shadowOpen.dataset.shadowOpen);
+    const panel = document.querySelector(`#shadow-panel-${index}`);
+    if (!panel.hidden && (state.shadowRecording?.index === index || state.shadowPending?.index === index)) {
+      if (state.shadowPending?.index === index) { state.shadowPending.cancelled = true; state.shadowPending = null; }
+      if (state.shadowRecording?.index === index) cancelShadowRecording();
+    }
+    panel.hidden = !panel.hidden;
+    updateShadowUI(index);
+    return;
+  }
+  const shadowRecord = event.target.closest('[data-shadow-record]');
+  if (shadowRecord) { startShadowRecording(Number(shadowRecord.dataset.shadowRecord)); return; }
+  const shadowStop = event.target.closest('[data-shadow-stop]');
+  if (shadowStop) { finishShadowRecording(Number(shadowStop.dataset.shadowStop)); return; }
+  const shadowMode = event.target.closest('[data-shadow-mode]');
+  if (shadowMode) { playShadowMode(Number(shadowMode.dataset.shadowIndex), shadowMode.dataset.shadowMode); return; }
+  const shadowOffset = event.target.closest('[data-shadow-offset]');
+  if (shadowOffset) { adjustShadowOffset(Number(shadowOffset.dataset.shadowIndex), Number(shadowOffset.dataset.shadowOffset)); return; }
   const retry = event.target.closest('[data-translation-retry]');
   if (retry) { event.preventDefault(); event.stopPropagation(); requestTranslation(Number(retry.dataset.translationRetry)); return; }
   const translation = event.target.closest('[data-translation-line]');
   if (translation) { event.preventDefault(); event.stopPropagation(); toggleTranslation(Number(translation.dataset.translationLine)); return; }
   const seekLine = event.target.closest('[data-play-line]');
   if (seekLine) {
+    if (state.shadowRecording) cancelShadowRecording();
+    if (state.shadowPlayback) stopShadowPlayback(true);
     if (state.loopLine >= 0) { setLoop(-1); showToast('Sentence repeat turned off'); }
     activateLine(Number(seekLine.dataset.playLine), true); savePosition(true); return;
   }
   const loop = event.target.closest('[data-loop-line]');
-  if (loop) { const index = Number(loop.dataset.loopLine); const enabling = state.loopLine !== index; setLoop(enabling ? index : -1); if (enabling) activateLine(index, true); return; }
+  if (loop) { if (state.shadowRecording) cancelShadowRecording(); if (state.shadowPlayback) stopShadowPlayback(true); const index = Number(loop.dataset.loopLine); const enabling = state.loopLine !== index; setLoop(enabling ? index : -1); if (enabling) activateLine(index, true); return; }
   const word = event.target.closest('.word'); if (word) {
+    if (state.shadowRecording) cancelShadowRecording();
+    if (state.shadowPlayback) stopShadowPlayback(true);
     const index = Number(word.dataset.line);
     if (state.loopLine >= 0) { setLoop(-1); showToast('Sentence repeat turned off'); }
     activateLine(index, false);
@@ -649,7 +949,7 @@ $('#transcript-lines').addEventListener('click', (event) => {
     audio.play().catch(() => {}); savePosition(true);
   }
 });
-$('#play-button').addEventListener('click', () => { if (audio.paused) audio.play().catch((error) => showToast(error.message)); else audio.pause(); });
+$('#play-button').addEventListener('click', () => { if (state.shadowPlayback) { stopShadowPlayback(true); return; } if (audio.paused) audio.play().catch((error) => showToast(error.message)); else audio.pause(); });
 $('#speed-menu').innerHTML = state.speeds.map((speed) => `<button type="button" class="speed-option" data-speed="${speed}" aria-pressed="${speed === 1}">${fmtRate(speed)}</button>`).join('');
 setPlaybackSpeed(state.speeds[state.speedIndex]);
 $('#speed-button').addEventListener('click', () => {
@@ -688,6 +988,8 @@ document.addEventListener('keydown', (event) => {
   }
 });
 $('#repeat-button').addEventListener('click', () => {
+  if (state.shadowRecording) cancelShadowRecording();
+  if (state.shadowPlayback) stopShadowPlayback(true);
   const index = state.activeLine >= 0 ? state.activeLine : 0;
   if (!state.segments[index]) { showToast('Create a transcript to repeat a sentence'); return; }
   const enabling = state.loopLine !== index;
@@ -714,9 +1016,20 @@ audio.addEventListener('seeked', () => { updatePlayer(); savePosition(); updateM
 audio.addEventListener('play', () => { updatePlayButton(); startVisualUpdates(); });
 audio.addEventListener('pause', () => { updatePlayButton(); if (!state.switchingEpisode) savePosition(true); stopVisualUpdates(); });
 audio.addEventListener('loadedmetadata', () => { updatePlayer(); updateMediaPosition(true); });
-audio.addEventListener('ended', () => { savePosition(true); if (state.loopLine >= 0) { audio.currentTime = Number(state.segments[state.loopLine]?.start) || 0; audio.play().catch(() => {}); } else stopVisualUpdates(); });
-window.addEventListener('pagehide', () => savePosition(true));
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') savePosition(true); });
+audio.addEventListener('ended', () => { savePosition(true); if (state.shadowRecording) { audio.pause(); state.shadowRecording.waitingForSpeechEnd = true; updateShadowUI(state.shadowRecording.index); } else if (state.shadowPlayback) { state.shadowPlayback.sourceEnded = true; if (state.shadowPlayback.mode === 'original' || state.shadowPlayback.takeEnded) stopShadowPlayback(false); } else if (state.loopLine >= 0) { audio.currentTime = Number(state.segments[state.loopLine]?.start) || 0; audio.play().catch(() => {}); } else stopVisualUpdates(); });
+shadowTakeAudio.addEventListener('ended', () => {
+  const playback = state.shadowPlayback;
+  if (!playback) return;
+  if (playback.mode === 'both') {
+    playback.takeEnded = true;
+    if (playback.delayedElement === shadowTakeAudio && playback.delayPending) return;
+    if (playback.sourceEnded) stopShadowPlayback(false);
+    return;
+  }
+  stopShadowPlayback(false);
+});
+window.addEventListener('pagehide', () => { savePosition(true); clearShadowSession(); });
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') { savePosition(true); clearShadowSession(); } });
 
 if (navigator.mediaSession) {
   const actions = {

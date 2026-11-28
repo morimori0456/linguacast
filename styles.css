@@ -143,6 +143,21 @@ button:focus-visible,input:focus-visible,a:focus-visible{outline:3px solid #476f
 .translation-content[hidden]{display:none}
 .translation-content.translation-loading{color:#566650}
 .translation-content.translation-error{color:#a14d3f;background:#fbefec;border-left-color:#d29689}
+.shadow-open{flex:0 0 44px;width:44px;height:44px;min-height:44px;display:grid;place-items:center;border:0;border-radius:9px;background:transparent;color:#526b43;font-size:18px}
+.shadow-open:hover,.shadow-open.has-take{background:#e8efdb;color:#385333}
+.shadow-panel{margin:10px 0 8px;padding:12px;border:1px solid #dce3d1;border-radius:12px;background:#fafbf7}
+.shadow-panel[hidden]{display:none}
+.shadow-actions,.shadow-offset{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.shadow-actions button,.shadow-offset button{min-height:44px;padding:7px 11px;border:1px solid #d8decf;border-radius:9px;background:#fff;color:#435441;font-size:13px;font-weight:600}
+.shadow-actions button:disabled,.shadow-offset button:disabled{opacity:.45;cursor:not-allowed}
+.shadow-actions button[aria-pressed="true"]{border-color:#78915a;background:#dfeac8;color:#304b2d}
+.shadow-actions .shadow-record{background:#526f43;color:#fff;border-color:#526f43}
+.shadow-actions .shadow-stop{background:#a7483d;color:#fff;border-color:#a7483d}
+.shadow-offset{margin-top:9px;font-size:12px;color:#65715f}
+.shadow-offset-value{min-width:48px;text-align:center;font-variant-numeric:tabular-nums}
+.shadow-status{margin:9px 0 0;font-size:13px;color:#4f5e4e}
+.shadow-status.recording{color:#a7483d;font-weight:700}
+.shadow-hint{margin:5px 0 0;font-size:11px;color:#778174;line-height:1.45}
 @media(max-width:650px){
  .transcript-line{padding:12px 0}
  .sentence-toolbar{gap:6px}
@@ -150,4 +165,8 @@ button:focus-visible,input:focus-visible,a:focus-visible{outline:3px solid #476f
  .sentence-toolbar .translation-toggle{min-height:44px;padding:7px 9px}
  .line-text{font-size:16px;line-height:1.75}
  .translation-content{margin-top:7px;padding:10px 11px;font-size:15px}
+ .shadow-panel{padding:10px}
+ .shadow-actions{gap:6px}
+ .shadow-actions button{flex:1 1 auto}
+ .shadow-offset{gap:6px}
 }

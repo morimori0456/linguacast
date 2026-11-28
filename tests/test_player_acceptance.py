@@ -12,6 +12,7 @@ uses a generated short WAV. It never calls a real podcast or transcription API.
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import json
 import math
@@ -376,6 +377,159 @@ class PlayerAcceptanceTest(unittest.TestCase):
                 self.assertLessEqual(invalid_page.locator("body").evaluate("el => el.scrollWidth"), 320)
                 invalid_page.close()
                 self.assertEqual(errors, [], f"Unexpected browser errors: {errors}")
+            finally:
+                browser.close()
+
+    def test_shadow_recording_is_temporary_cancelable_and_rate_matched(self) -> None:
+        feed = {"id": 10, "title": "Shadow Test", "image_url": ""}
+        episode = {"id": 101, "feed_id": 10, "title": "Shadow Episode", "duration": "00:00:07",
+                   "audio_path": "/api/episodes/101/audio", "has_transcript": True}
+        transcript = {"status": "ready", "transcript": {"segments": [{"start": 0.2, "end": 0.85,
+            "text": "A short sentence.", "source_fingerprint": "a" * 64,
+            "words": [{"start": 0.2, "end": 0.85, "word": "sentence."}]}]}}
+        wav_base64 = base64.b64encode(self.audio_bytes).decode("ascii")
+
+        def fulfill_api(route) -> None:
+            path = route.request.url.split(self.base_url, 1)[-1].split("?", 1)[0]
+            if path == "/api/feeds": route.fulfill(json=[feed])
+            elif path == "/api/feeds/10/refresh": route.fulfill(json={"episode_count": 1})
+            elif path == "/api/feeds/10/episodes": route.fulfill(json=[episode])
+            elif path == "/api/episodes/101": route.fulfill(json=episode)
+            elif path == "/api/episodes/101/transcript": route.fulfill(json=transcript)
+            elif path == "/api/episodes/101/audio": route.fulfill(status=200, body=self.audio_bytes, content_type="audio/wav")
+            else: route.fulfill(status=404, json={"detail": "Unexpected test API call"})
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(executable_path=os.environ.get("CHROMIUM_PATH") or None,
+                headless=True, args=["--no-sandbox", "--autoplay-policy=no-user-gesture-required"])
+            page = browser.new_page(viewport={"width": 390, "height": 844}, is_mobile=True, has_touch=True)
+            page.set_default_timeout(5000)
+            page.add_init_script(f"""(() => {{
+              window.__tracks = []; window.__deferMic = false; window.__micRequests = []; window.__throwRecorder = false;
+              window.__failNextOriginalPlay = false;
+              const nativePlay = HTMLMediaElement.prototype.play;
+              HTMLMediaElement.prototype.play = function() {{
+                if (this.id === 'audio' && window.__failNextOriginalPlay) {{
+                  window.__failNextOriginalPlay = false; return Promise.reject(new Error('Synthetic playback failure'));
+                }}
+                return nativePlay.call(this);
+              }};
+              const stream = () => {{ const track = {{stopped: false, stop() {{ this.stopped = true; }}}};
+                window.__tracks.push(track); return {{getTracks: () => [track]}}; }};
+              navigator.mediaDevices.getUserMedia = () => window.__deferMic
+                ? new Promise((resolve, reject) => {{ window.__micRequests.push({{resolve: () => resolve(stream()), reject}}); }})
+                : Promise.resolve(stream());
+              window.MediaRecorder = class extends EventTarget {{
+                static isTypeSupported() {{ return false; }}
+                constructor(_stream, options={{}}) {{ super(); if (window.__throwRecorder) {{ window.__throwRecorder = false; throw new Error('Synthetic recorder construction failure'); }} this.state='inactive'; this.mimeType=options.mimeType || 'audio/wav'; }}
+                start() {{ this.state='recording'; }}
+                stop() {{ this.state='inactive'; queueMicrotask(() => {{
+                  this.dispatchEvent(new BlobEvent('dataavailable', {{data: new Blob([Uint8Array.from(atob('{wav_base64}'), c => c.charCodeAt(0))], {{type:'audio/wav'}})}}));
+                  this.dispatchEvent(new Event('stop'));
+                }}); }}
+            }};
+            }})();""")
+            page.route("**/api/**", fulfill_api)
+            try:
+                page.goto(self.base_url, wait_until="domcontentloaded")
+                page.locator('[data-feed-id="10"]').click()
+                page.locator('[data-episode-id="101"]').click()
+                page.locator(".transcript-line").first.wait_for()
+                page.wait_for_function("document.querySelector('#audio').readyState >= 1")
+
+                # A permission prompt can resolve after the panel is closed;
+                # its late stream must be stopped without starting a recorder.
+                opener = page.locator('[data-shadow-open="0"]')
+                opener.click()
+                page.evaluate("window.__deferMic = true")
+                page.locator('[data-shadow-record="0"]').click()
+                page.wait_for_function("window.__micRequests.length === 1")
+                opener.click()
+                page.evaluate("window.__micRequests[0].resolve()")
+                page.wait_for_function("window.__tracks.length === 1 && window.__tracks[0].stopped")
+                self.assertFalse(page.locator("#shadow-panel-0").is_visible())
+
+                # A stale rejection from a canceled request must not cancel a
+                # later recording request for the same sentence.
+                opener.click()
+                page.evaluate("window.__deferMic = true")
+                page.locator('[data-shadow-record="0"]').click()
+                page.wait_for_function("window.__micRequests.length === 2")
+                opener.click()
+                opener.click()
+                page.evaluate("window.__deferMic = false")
+                page.locator('[data-shadow-record="0"]').click()
+                page.locator('[data-shadow-stop="0"]').wait_for(state="visible")
+                page.evaluate("window.__micRequests[1].reject(new DOMException('Canceled request', 'NotAllowedError'))")
+                page.locator('[data-shadow-stop="0"]').wait_for(state="visible")
+                page.locator('[data-shadow-stop="0"]').click()
+                page.wait_for_function("window.__tracks.length === 2 && window.__tracks[1].stopped")
+
+                # If starting the original fails after permission is granted,
+                # the owned recorder and microphone still need to be cleaned.
+                page.evaluate("window.__failNextOriginalPlay = true")
+                page.locator('[data-shadow-record="0"]').click()
+                page.get_by_text("Could not start recording. Try again.", exact=True).wait_for()
+                page.wait_for_function("window.__tracks.length === 3 && window.__tracks[2].stopped")
+
+                # Recorder construction can fail after microphone permission;
+                # that request must leave the UI retryable and stop its stream.
+                page.evaluate("window.__throwRecorder = true")
+                page.locator('[data-shadow-record="0"]').click()
+                page.get_by_text("Could not start recording. Try again.", exact=True).wait_for()
+                page.wait_for_function("window.__tracks.length === 4 && window.__tracks[3].stopped")
+
+                # Record at 1.5x, then change the player preference. Replay
+                # uses the capture rate and restores the user's selected rate.
+                page.locator("#speed-button").click()
+                page.locator('.speed-option[data-speed="1.5"]').click()
+                page.locator('[data-shadow-record="0"]').click()
+                page.locator('[data-shadow-stop="0"]').wait_for(state="visible")
+                page.locator('[data-shadow-stop="0"]').click()
+                page.wait_for_function("!document.querySelector('[data-shadow-mode=\\\"take\\\"]').disabled")
+                self.assertEqual(page.locator('[data-shadow-mode="both"]').count(), 1)
+                self.assertTrue(page.locator('[data-shadow-offset="1"]').is_enabled())
+                page.locator('[data-shadow-offset="1"]').click()
+                self.assertEqual(page.locator(".shadow-offset-value").inner_text(), "+0.1 s")
+                page.locator('[data-shadow-offset="-1"]').click()
+                self.assertEqual(page.locator(".shadow-offset-value").inner_text(), "+0.0 s")
+                for _ in range(20):
+                    page.locator('[data-shadow-offset="-1"]').click()
+                self.assertEqual(page.locator(".shadow-offset-value").inner_text(), "−1.5 s")
+                for _ in range(15):
+                    page.locator('[data-shadow-offset="1"]').click()
+                self.assertEqual(page.locator(".shadow-offset-value").inner_text(), "+0.0 s")
+                page.locator('[data-shadow-mode="both"]').click()
+                page.wait_for_function("document.querySelector('#audio').paused && document.querySelector('[data-shadow-mode=both]').getAttribute('aria-pressed') === 'true'")
+                self.assertFalse(page.locator("#shadow-take-audio").evaluate("el => el.paused"), "a short take must not cut off the longer original")
+                page.locator("#shadow-take-audio").evaluate("el => el.dispatchEvent(new Event('ended'))")
+                page.wait_for_function("document.querySelector('[data-shadow-mode=both]').getAttribute('aria-pressed') === 'false'")
+
+                # A take that ends during its muted prewarm is rewound and
+                # restarted at the selected offset, then keeps playing.
+                page.locator('[data-shadow-offset="1"]').click()
+                page.locator('[data-shadow-mode="both"]').click()
+                page.locator("#shadow-take-audio").evaluate("el => el.dispatchEvent(new Event('ended'))")
+                page.wait_for_timeout(200)
+                self.assertEqual(page.locator('[data-shadow-mode="both"]').get_attribute("aria-pressed"), "true")
+                self.assertAlmostEqual(page.locator("#shadow-take-audio").evaluate("el => el.playbackRate"), 1)
+                page.locator("#play-button").click()
+                page.locator('[data-shadow-offset="-1"]').click()
+                page.locator("#speed-button").click()
+                page.locator('.speed-option[data-speed="0.5"]').click()
+                page.locator('[data-shadow-mode="original"]').click()
+                self.assertAlmostEqual(page.locator("#audio").evaluate("el => el.playbackRate"), 1.5)
+                page.locator("#play-button").click()
+                self.assertAlmostEqual(page.locator("#audio").evaluate("el => el.playbackRate"), 0.5)
+                self.assertEqual(page.evaluate("localStorage.getItem('linguacast-shadow-take')"), None)
+                self.assertTrue(page.evaluate("window.__tracks.every(track => track.stopped)"))
+
+                # Closing during capture cancels and releases the microphone.
+                page.locator('[data-shadow-record="0"]').click()
+                page.locator('[data-shadow-stop="0"]').wait_for(state="visible")
+                opener.click()
+                page.wait_for_function("window.__tracks.length === 6 && window.__tracks[5].stopped")
+                self.assertEqual(page.evaluate("window.__tracks.length"), 6)
             finally:
                 browser.close()
 

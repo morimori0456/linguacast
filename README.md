@@ -36,6 +36,15 @@ The default speech model is `small.en`. On its first use, faster-whisper downloa
 3. Choose **Create transcript**. The episode audio is downloaded and cached, then transcription begins. Progress is shown on the episode screen.
 4. When the transcript is ready, press play. Tap any word to jump to that point, or use the repeat control beside a sentence to practice it again.
 
+## Record a shadowing take
+
+1. Open a transcript sentence and tap its microphone icon.
+2. Tap **Record** and allow microphone access. LinguaCast plays that sentence from the original episode while recording your voice.
+3. Tap **Stop recording** when you finish. If the original sentence ends first, the recording stays active so you can finish the phrase.
+4. Replay **Original**, **My recording**, or **Play together**. Use the offset buttons to move the recording earlier or later in 0.1-second steps, up to 1.5 seconds.
+
+Recordings stay in memory in the current page only. A new take replaces the previous take; closing the player, opening another episode, hiding the page, or leaving it clears the take and stops microphone tracks. LinguaCast does not upload or persist recordings. Allow microphone access when prompted and use headphones to reduce the original audio leaking into the recording. Recording requires a browser that supports microphone capture and MediaRecorder; browser and iPhone behavior can vary.
+
 ## Automatic transcripts for new episodes
 
 LinguaCast checks registered RSS feeds for new releases while its server is running. It checks every 15 minutes by default; set `AUTO_REFRESH_INTERVAL_SECONDS` to change the interval. Automatic transcription starts only for episodes published after a feed was registered. Episodes already in the feed at registration are the baseline and are not transcribed automatically, so this does not create a backlog. When upgrading an existing library, the episodes currently in each feed become its baseline. Episodes with a missing, invalid, or older publication date are skipped because LinguaCast cannot reliably determine that they are new.
