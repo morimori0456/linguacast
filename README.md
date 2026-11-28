@@ -43,7 +43,7 @@ The default speech model is `small.en`. On its first use, faster-whisper downloa
 3. Tap **Stop recording** when you finish. If the original sentence ends first, the recording stays active so you can finish the phrase.
 4. Replay **Original**, **My recording**, or **Play together**. Use the offset buttons to move the recording earlier or later in 0.1-second steps, up to 1.5 seconds.
 
-Recordings stay in memory in the current page only. A new take replaces the previous take; closing the player, opening another episode, hiding the page, or leaving it clears the take and stops microphone tracks. LinguaCast does not upload or persist recordings. Allow microphone access when prompted and use headphones to reduce the original audio leaking into the recording. Recording requires a browser that supports microphone capture and MediaRecorder; browser and iPhone behavior can vary.
+Recordings stay in memory in the current page only. A new take replaces the previous take; closing the player, opening another episode, hiding the page, or leaving it clears the take and stops microphone tracks. LinguaCast does not upload or persist recordings. The player measures the recorder-to-playback startup delay and applies it as the initial alignment offset, rounded to 0.1 seconds and limited to 1.5 seconds; use the offset controls to refine it. Allow microphone access when prompted and use headphones to reduce the original audio leaking into the recording. Recording requires a browser that supports microphone capture and MediaRecorder. iPhone/WebKit and Bluetooth timing still need device testing.
 
 ## Automatic transcripts for new episodes
 

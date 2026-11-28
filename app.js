@@ -22,6 +22,10 @@ function setPlaybackSpeed(value) {
   const speed = Number(value);
   const index = state.speeds.indexOf(speed);
   if (index < 0) return;
+  if (speed !== audio.playbackRate) {
+    cancelShadowCapture();
+    if (state.shadowPlayback) stopShadowPlayback(true);
+  }
   state.speedIndex = index;
   audio.defaultPlaybackRate = speed;
   audio.playbackRate = speed;
@@ -54,6 +58,8 @@ function updateSkipControls() {
   $('#forward-button').title = `Skip forward ${state.forwardSeconds} seconds`;
 }
 function seekBy(offset) {
+  cancelShadowCapture();
+  if (state.shadowPlayback) stopShadowPlayback(true);
   const duration = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : Infinity;
   audio.currentTime = Math.max(0, Math.min(duration, audio.currentTime + offset));
   savePosition(true);
@@ -104,7 +110,7 @@ function updateShadowUI(index) {
   if (pending) status.textContent = 'Waiting for microphone permission…';
   else if (recorder) status.textContent = recorder.waitingForSpeechEnd
     ? 'Original finished. Finish speaking, then tap Stop.' : 'Recording with the original…';
-  else if (take) status.textContent = 'Take ready. Kept in memory until you close this player.';
+  else if (take) status.textContent = 'Take ready. Kept in memory until you leave this page.';
   else status.textContent = 'Record this sentence along with the original.';
   status.classList.toggle('recording', Boolean(recorder));
 }
@@ -116,12 +122,13 @@ function stopShadowPlayback(pauseOriginal = true) {
   if (playback?.delayTimer) clearTimeout(playback.delayTimer);
   state.shadowPlayback = null;
   shadowTakeAudio.pause();
-  if (playback?.delayedElement && playback.savedDelayedRate) playback.delayedElement.playbackRate = playback.savedDelayedRate;
+  shadowTakeAudio.loop = false;
+  audio.loop = false;
   shadowTakeAudio.currentTime = 0;
   shadowTakeAudio.muted = false;
   audio.muted = false;
   if (playback) audio.playbackRate = state.speeds[state.speedIndex];
-  if (pauseOriginal) audio.pause();
+  if (pauseOriginal && playback) audio.pause();
   if (playback) updateShadowUI(playback.index);
 }
 function stopShadowStream(recording) {
@@ -141,16 +148,27 @@ function cancelShadowRecording() {
   recording.cancelled = true;
   state.shadowRecording = null;
   clearShadowTimers(recording);
+  audio.pause();
   if (recording.recorder.state !== 'inactive') {
     try { recording.recorder.stop(); } catch { /* The stream may already have stopped. */ }
   }
   recording.stream?.getTracks().forEach((track) => track.stop());
-  if (recording.index !== undefined) updateShadowUI(recording.index);
+  updateAllShadowUI();
+}
+function cancelShadowCapture() {
+  if (state.shadowPending) {
+    state.shadowPending.cancelled = true;
+    state.shadowPending = null;
+  }
+  if (state.shadowRecording) cancelShadowRecording();
+  else updateAllShadowUI();
 }
 function clearShadowSession() {
-  if (state.shadowPending) { state.shadowPending.cancelled = true; state.shadowPending = null; }
+  cancelShadowCapture();
   stopShadowPlayback(true);
-  cancelShadowRecording();
+  shadowTakeAudio.pause();
+  shadowTakeAudio.removeAttribute('src');
+  shadowTakeAudio.load();
   if (state.shadowTake?.url) URL.revokeObjectURL(state.shadowTake.url);
   state.shadowTake = null;
   updateAllShadowUI();
@@ -174,7 +192,7 @@ async function startShadowRecording(index) {
   const requestId = state.episodeRequestId;
   const pending = { index, episodeId, requestId, fingerprint: segment.fingerprint, cancelled: false };
   state.shadowPending = pending;
-  updateShadowUI(index);
+  updateAllShadowUI();
   let stream;
   try {
     stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
@@ -187,7 +205,7 @@ async function startShadowRecording(index) {
     const playbackRate = Math.max(0.5, Number(audio.playbackRate) || 1);
     const maxRecordingMs = Math.ceil((segment.end - segment.start) / playbackRate * 1000) + SHADOW_RECORDING_TAIL_MS;
     const recording = { index, episodeId, fingerprint: segment.fingerprint, segment, stream, recorder, request: pending, playbackRate,
-      chunks: [], stopTimer: null, monitorFrame: null, waitingForSpeechEnd: false, cancelled: false };
+      chunks: [], stopTimer: null, monitorFrame: null, waitingForSpeechEnd: false, cancelled: false, offsetMs: 0 };
     state.shadowRecording = recording;
     state.shadowPending = null;
     recorder.addEventListener('dataavailable', (event) => { if (event.data?.size) recording.chunks.push(event.data); });
@@ -204,15 +222,29 @@ async function startShadowRecording(index) {
         if (blob.size > SHADOW_MAX_RECORDING_BYTES) {
           showToast('Recording is too large. Please record a shorter take.');
         } else {
-          if (state.shadowTake?.url) URL.revokeObjectURL(state.shadowTake.url);
-          state.shadowTake = { episodeId, fingerprint: segment.fingerprint, index, blob, url: URL.createObjectURL(blob), offsetMs: 0, playbackRate };
+          if (state.shadowTake?.url) {
+            shadowTakeAudio.pause();
+            shadowTakeAudio.removeAttribute('src');
+            shadowTakeAudio.load();
+            URL.revokeObjectURL(state.shadowTake.url);
+          }
+          state.shadowTake = { episodeId, fingerprint: segment.fingerprint, index, blob, url: URL.createObjectURL(blob), offsetMs: recording.offsetMs, playbackRate };
         }
       }
-      if (state.shadowRecording !== recording) updateShadowUI(index);
+      updateAllShadowUI();
     }, { once: true });
     recorder.start();
+    const recorderStartedAt = performance.now();
+    recording.stopTimer = setTimeout(() => {
+      if (state.shadowRecording === recording) finishShadowRecording(index);
+    }, maxRecordingMs);
+    updateAllShadowUI();
+    audio.pause();
     audio.currentTime = segment.start;
     await audio.play();
+    if (state.shadowRecording !== recording || recording.finishing || recording.cancelled) return;
+    const startupDelayMs = Math.max(0, Math.min(SHADOW_OFFSET_LIMIT_MS, Math.round((performance.now() - recorderStartedAt) / SHADOW_OFFSET_STEP_MS) * SHADOW_OFFSET_STEP_MS));
+    recording.offsetMs = startupDelayMs >= SHADOW_OFFSET_STEP_MS ? -startupDelayMs : 0;
     const monitor = () => {
       if (state.shadowRecording !== recording || recording.waitingForSpeechEnd) return;
       if (audio.currentTime >= segment.end) {
@@ -224,30 +256,28 @@ async function startShadowRecording(index) {
       recording.monitorFrame = requestAnimationFrame(monitor);
     };
     recording.monitorFrame = requestAnimationFrame(monitor);
-    recording.stopTimer = setTimeout(() => {
-      if (state.shadowRecording === recording) finishShadowRecording(index);
-    }, maxRecordingMs);
-    updateShadowUI(index);
+    updateAllShadowUI();
   } catch (error) {
     stream?.getTracks().forEach((track) => track.stop());
     const ownsPending = state.shadowPending === pending;
     const ownsRecording = state.shadowRecording?.request === pending;
-    if (pending.cancelled || (!ownsPending && !ownsRecording)) return;
+    if (pending.cancelled || (!ownsPending && !ownsRecording) || (ownsRecording && state.shadowRecording.finishing)) return;
     if (ownsPending) state.shadowPending = null;
     if (ownsRecording) cancelShadowRecording();
     stopShadowPlayback(true);
     showToast(error?.name === 'NotAllowedError' ? 'Allow microphone access to record.' : 'Could not start recording. Try again.');
-    updateShadowUI(index);
+    updateAllShadowUI();
   }
 }
 function finishShadowRecording(index) {
   const recording = state.shadowRecording;
   if (!recording || recording.index !== index || recording.recorder.state === 'inactive') return;
+  recording.finishing = true;
   clearShadowTimers(recording);
   audio.pause();
   try { recording.recorder.stop(); }
   catch { cancelShadowRecording(); showToast('Could not finish recording.'); }
-  updateShadowUI(index);
+  updateAllShadowUI();
 }
 function playShadowMode(index, mode) {
   if (state.shadowPending || state.shadowRecording) { showToast('Finish or cancel recording before playback.'); return; }
@@ -286,10 +316,9 @@ function playShadowMode(index, mode) {
   if (delay > 0) {
     delayedElement.muted = true;
     playback.delayedElement = delayedElement;
-    playback.savedDelayedRate = delayedElement.playbackRate;
-    // Keep the prewarmed, muted track alive until its offset expires, even
-    // when the sentence itself is shorter than the selected offset.
-    delayedElement.playbackRate = Math.min(playback.savedDelayedRate, 0.0625);
+    // Keep the delayed track playing silently until its offset expires. The
+    // take can loop natively; the source sentence loops in updatePlayer().
+    if (delayedElement === shadowTakeAudio) shadowTakeAudio.loop = true;
   }
   const startOriginal = audio.play();
   const startTake = shadowTakeAudio.play();
@@ -299,10 +328,12 @@ function playShadowMode(index, mode) {
       if (state.shadowPlayback !== playback) return;
       playback.delayTimer = null;
       playback.delayPending = false;
-      playback.takeEnded = false;
-      if (delayedElement === shadowTakeAudio) shadowTakeAudio.currentTime = 0;
+      if (delayedElement === shadowTakeAudio) {
+        playback.takeEnded = false;
+        shadowTakeAudio.currentTime = 0;
+      }
       else { audio.currentTime = segment.start; playback.sourceEnded = false; }
-      delayedElement.playbackRate = playback.savedDelayedRate;
+      if (delayedElement === shadowTakeAudio) shadowTakeAudio.loop = false;
       delayedElement.muted = false;
       if (delayedElement.paused) delayedElement.play().catch(() => {
         if (state.shadowPlayback !== playback) return;
@@ -673,7 +704,7 @@ function renderTranscript() {
     if (!words.length) wordsHTML = `<span class="word" data-line="${index}" data-word="0" data-start="${start}" data-end="${end}">${wordsHTML}</span>`;
     const cached = translationEntry(index);
     const translationHTML = cached?.translation ? escapeHTML(cached.translation) : cached?.error ? escapeHTML(cached.error) : '';
-    return `<article class="transcript-line" data-line="${index}" data-start="${start}" data-end="${end}"><div class="sentence-toolbar"><button type="button" class="line-time" data-play-line="${index}" aria-label="Play from ${fmtTime(start)}">${fmtTime(start)}</button><button type="button" class="translation-toggle" data-translation-line="${index}" aria-expanded="false" aria-controls="translation-${index}">Show Japanese</button><button class="line-loop" data-loop-line="${index}" aria-label="Repeat this sentence" aria-pressed="false">↻</button><button class="shadow-open" type="button" data-shadow-open="${index}" aria-label="Practice this sentence" aria-expanded="false" aria-controls="shadow-panel-${index}" title="Record this sentence">🎙</button></div><div class="line-text">${wordsHTML}</div><div id="translation-${index}" class="translation-content" aria-live="polite" hidden><div class="translation-ja">${translationHTML}</div><div class="expression-notes" hidden></div><button type="button" class="expression-retry" data-translation-retry="${index}" hidden>Retry expression notes</button></div><section class="shadow-panel" id="shadow-panel-${index}" aria-label="Shadow this sentence" hidden><div class="shadow-actions"><button type="button" class="shadow-record" data-shadow-record="${index}">Record</button><button type="button" class="shadow-stop" data-shadow-stop="${index}" hidden>Stop recording</button><button type="button" data-shadow-mode="original" data-shadow-index="${index}">Original</button><button type="button" data-shadow-mode="take" data-shadow-index="${index}" disabled>My recording</button><button type="button" data-shadow-mode="both" data-shadow-index="${index}" disabled>Play together</button></div><div class="shadow-offset"><span>Recording start</span><button type="button" data-shadow-offset="-1" data-shadow-index="${index}" aria-label="Start recording 0.1 seconds earlier" disabled>−0.1</button><span class="shadow-offset-value">+0.0 s</span><button type="button" data-shadow-offset="1" data-shadow-index="${index}" aria-label="Start recording 0.1 seconds later" disabled>+0.1</button></div><p class="shadow-status" role="status" aria-live="polite">Record this sentence along with the original.</p><p class="shadow-hint">Use headphones for best results. This take stays in memory until you close the player.</p></section></article>`;
+    return `<article class="transcript-line" data-line="${index}" data-start="${start}" data-end="${end}"><div class="sentence-toolbar"><button type="button" class="line-time" data-play-line="${index}" aria-label="Play from ${fmtTime(start)}">${fmtTime(start)}</button><button type="button" class="translation-toggle" data-translation-line="${index}" aria-expanded="false" aria-controls="translation-${index}">Show Japanese</button><button class="line-loop" data-loop-line="${index}" aria-label="Repeat this sentence" aria-pressed="false">↻</button><button class="shadow-open" type="button" data-shadow-open="${index}" aria-label="Practice this sentence" aria-expanded="false" aria-controls="shadow-panel-${index}" title="Record this sentence">🎙</button></div><div class="line-text">${wordsHTML}</div><div id="translation-${index}" class="translation-content" aria-live="polite" hidden><div class="translation-ja">${translationHTML}</div><div class="expression-notes" hidden></div><button type="button" class="expression-retry" data-translation-retry="${index}" hidden>Retry expression notes</button></div><section class="shadow-panel" id="shadow-panel-${index}" aria-label="Shadow this sentence" hidden><div class="shadow-actions"><button type="button" class="shadow-record" data-shadow-record="${index}">Record</button><button type="button" class="shadow-stop" data-shadow-stop="${index}" hidden>Stop recording</button><button type="button" data-shadow-mode="original" data-shadow-index="${index}">Original</button><button type="button" data-shadow-mode="take" data-shadow-index="${index}" disabled>My recording</button><button type="button" data-shadow-mode="both" data-shadow-index="${index}" disabled>Play together</button></div><div class="shadow-offset"><span>Recording start</span><button type="button" data-shadow-offset="-1" data-shadow-index="${index}" aria-label="Start recording 0.1 seconds earlier" disabled>−0.1</button><span class="shadow-offset-value">+0.0 s</span><button type="button" data-shadow-offset="1" data-shadow-index="${index}" aria-label="Start recording 0.1 seconds later" disabled>+0.1</button></div><p class="shadow-status" role="status" aria-live="polite">Record this sentence along with the original.</p><p class="shadow-hint">Use headphones for best results. This take stays in memory until you leave this page.</p></section></article>`;
   }).join('');
   state.segments.forEach((_, index) => updateTranslationUI(index));
 }
@@ -831,6 +862,10 @@ function updatePlayer() {
     state.shadowRecording.waitingForSpeechEnd = true;
     updateShadowUI(state.shadowRecording.index);
   }
+  if (state.shadowPlayback?.mode === 'both' && state.shadowPlayback.delayPending
+      && state.shadowPlayback.delayedElement === audio && audio.currentTime >= state.shadowPlayback.segment.end) {
+    audio.currentTime = state.shadowPlayback.segment.start;
+  }
   if (state.shadowPlayback?.singlePass && !state.shadowPlayback.sourceEnded
       && audio.currentTime >= state.shadowPlayback.segment.end) {
     audio.pause();
@@ -911,8 +946,7 @@ $('#transcript-lines').addEventListener('click', (event) => {
     const index = Number(shadowOpen.dataset.shadowOpen);
     const panel = document.querySelector(`#shadow-panel-${index}`);
     if (!panel.hidden && (state.shadowRecording?.index === index || state.shadowPending?.index === index)) {
-      if (state.shadowPending?.index === index) { state.shadowPending.cancelled = true; state.shadowPending = null; }
-      if (state.shadowRecording?.index === index) cancelShadowRecording();
+      if (state.shadowPending?.index === index || state.shadowRecording?.index === index) cancelShadowCapture();
     }
     panel.hidden = !panel.hidden;
     updateShadowUI(index);
@@ -932,15 +966,15 @@ $('#transcript-lines').addEventListener('click', (event) => {
   if (translation) { event.preventDefault(); event.stopPropagation(); toggleTranslation(Number(translation.dataset.translationLine)); return; }
   const seekLine = event.target.closest('[data-play-line]');
   if (seekLine) {
-    if (state.shadowRecording) cancelShadowRecording();
+    cancelShadowCapture();
     if (state.shadowPlayback) stopShadowPlayback(true);
     if (state.loopLine >= 0) { setLoop(-1); showToast('Sentence repeat turned off'); }
     activateLine(Number(seekLine.dataset.playLine), true); savePosition(true); return;
   }
   const loop = event.target.closest('[data-loop-line]');
-  if (loop) { if (state.shadowRecording) cancelShadowRecording(); if (state.shadowPlayback) stopShadowPlayback(true); const index = Number(loop.dataset.loopLine); const enabling = state.loopLine !== index; setLoop(enabling ? index : -1); if (enabling) activateLine(index, true); return; }
+  if (loop) { cancelShadowCapture(); if (state.shadowPlayback) stopShadowPlayback(true); const index = Number(loop.dataset.loopLine); const enabling = state.loopLine !== index; setLoop(enabling ? index : -1); if (enabling) activateLine(index, true); return; }
   const word = event.target.closest('.word'); if (word) {
-    if (state.shadowRecording) cancelShadowRecording();
+    cancelShadowCapture();
     if (state.shadowPlayback) stopShadowPlayback(true);
     const index = Number(word.dataset.line);
     if (state.loopLine >= 0) { setLoop(-1); showToast('Sentence repeat turned off'); }
@@ -949,7 +983,7 @@ $('#transcript-lines').addEventListener('click', (event) => {
     audio.play().catch(() => {}); savePosition(true);
   }
 });
-$('#play-button').addEventListener('click', () => { if (state.shadowPlayback) { stopShadowPlayback(true); return; } if (audio.paused) audio.play().catch((error) => showToast(error.message)); else audio.pause(); });
+$('#play-button').addEventListener('click', () => { cancelShadowCapture(); if (state.shadowPlayback) { stopShadowPlayback(true); return; } if (audio.paused) audio.play().catch((error) => showToast(error.message)); else audio.pause(); });
 $('#speed-menu').innerHTML = state.speeds.map((speed) => `<button type="button" class="speed-option" data-speed="${speed}" aria-pressed="${speed === 1}">${fmtRate(speed)}</button>`).join('');
 setPlaybackSpeed(state.speeds[state.speedIndex]);
 $('#speed-button').addEventListener('click', () => {
@@ -988,7 +1022,7 @@ document.addEventListener('keydown', (event) => {
   }
 });
 $('#repeat-button').addEventListener('click', () => {
-  if (state.shadowRecording) cancelShadowRecording();
+  cancelShadowCapture();
   if (state.shadowPlayback) stopShadowPlayback(true);
   const index = state.activeLine >= 0 ? state.activeLine : 0;
   if (!state.segments[index]) { showToast('Create a transcript to repeat a sentence'); return; }
@@ -999,6 +1033,8 @@ $('#repeat-button').addEventListener('click', () => {
 
 const seek = $('#seek');
 const commitSeek = () => {
+  cancelShadowCapture();
+  if (state.shadowPlayback) stopShadowPlayback(true);
   if (Number.isFinite(audio.duration) && audio.duration > 0) audio.currentTime = Number(seek.value) / 1000 * audio.duration;
   state.seekDragging = false; updatePlayer(); savePosition(true); updateMediaPosition(true);
 };
@@ -1016,7 +1052,7 @@ audio.addEventListener('seeked', () => { updatePlayer(); savePosition(); updateM
 audio.addEventListener('play', () => { updatePlayButton(); startVisualUpdates(); });
 audio.addEventListener('pause', () => { updatePlayButton(); if (!state.switchingEpisode) savePosition(true); stopVisualUpdates(); });
 audio.addEventListener('loadedmetadata', () => { updatePlayer(); updateMediaPosition(true); });
-audio.addEventListener('ended', () => { savePosition(true); if (state.shadowRecording) { audio.pause(); state.shadowRecording.waitingForSpeechEnd = true; updateShadowUI(state.shadowRecording.index); } else if (state.shadowPlayback) { state.shadowPlayback.sourceEnded = true; if (state.shadowPlayback.mode === 'original' || state.shadowPlayback.takeEnded) stopShadowPlayback(false); } else if (state.loopLine >= 0) { audio.currentTime = Number(state.segments[state.loopLine]?.start) || 0; audio.play().catch(() => {}); } else stopVisualUpdates(); });
+audio.addEventListener('ended', () => { savePosition(true); if (state.shadowRecording) { audio.pause(); state.shadowRecording.waitingForSpeechEnd = true; updateShadowUI(state.shadowRecording.index); } else if (state.shadowPlayback?.mode === 'both' && state.shadowPlayback.delayPending && state.shadowPlayback.delayedElement === audio) { audio.currentTime = state.shadowPlayback.segment.start; audio.play().catch(() => {}); } else if (state.shadowPlayback) { state.shadowPlayback.sourceEnded = true; if (state.shadowPlayback.mode === 'original' || state.shadowPlayback.takeEnded) stopShadowPlayback(false); } else if (state.loopLine >= 0) { audio.currentTime = Number(state.segments[state.loopLine]?.start) || 0; audio.play().catch(() => {}); } else stopVisualUpdates(); });
 shadowTakeAudio.addEventListener('ended', () => {
   const playback = state.shadowPlayback;
   if (!playback) return;
@@ -1033,11 +1069,11 @@ document.addEventListener('visibilitychange', () => { if (document.visibilitySta
 
 if (navigator.mediaSession) {
   const actions = {
-    play: () => audio.play().catch(() => {}),
-    pause: () => audio.pause(),
+    play: () => { cancelShadowCapture(); if (state.shadowPlayback) stopShadowPlayback(true); audio.play().catch(() => {}); },
+    pause: () => { cancelShadowCapture(); if (state.shadowPlayback) stopShadowPlayback(true); else audio.pause(); },
     seekbackward: (detail = {}) => seekBy(-(Number.isFinite(detail.seekOffset) ? Math.abs(detail.seekOffset) : state.rewindSeconds)),
     seekforward: (detail = {}) => seekBy(Number.isFinite(detail.seekOffset) ? Math.abs(detail.seekOffset) : state.forwardSeconds),
-    seekto: (detail) => { if (Number.isFinite(detail.seekTime)) { if (typeof audio.fastSeek === 'function') audio.fastSeek(detail.seekTime); else audio.currentTime = detail.seekTime; savePosition(true); } },
+    seekto: (detail) => { if (Number.isFinite(detail.seekTime)) { cancelShadowCapture(); if (state.shadowPlayback) stopShadowPlayback(true); if (typeof audio.fastSeek === 'function') audio.fastSeek(detail.seekTime); else audio.currentTime = detail.seekTime; savePosition(true); } },
   };
   for (const [action, handler] of Object.entries(actions)) { try { navigator.mediaSession.setActionHandler(action, handler); } catch { /* Action is unsupported by this browser. */ } }
 }
