@@ -406,11 +406,18 @@ class PlayerAcceptanceTest(unittest.TestCase):
             page.set_default_timeout(5000)
             page.add_init_script(f"""(() => {{
               window.__tracks = []; window.__deferMic = false; window.__micRequests = []; window.__throwRecorder = false;
-              window.__failNextOriginalPlay = false;
+              window.__failNextOriginalPlay = false; window.__deferOriginalPlay = false; window.__delayOriginalPlayMs = 0; window.__playRequests = [];
               const nativePlay = HTMLMediaElement.prototype.play;
               HTMLMediaElement.prototype.play = function() {{
                 if (this.id === 'audio' && window.__failNextOriginalPlay) {{
                   window.__failNextOriginalPlay = false; return Promise.reject(new Error('Synthetic playback failure'));
+                }}
+                if (this.id === 'audio' && window.__deferOriginalPlay) {{
+                  return new Promise((resolve, reject) => window.__playRequests.push({{resolve, reject}}));
+                }}
+                if (this.id === 'audio' && window.__delayOriginalPlayMs) {{
+                  const delay = window.__delayOriginalPlayMs; window.__delayOriginalPlayMs = 0;
+                  return new Promise((resolve, reject) => setTimeout(() => nativePlay.call(this).then(resolve, reject), delay));
                 }}
                 return nativePlay.call(this);
               }};
@@ -436,6 +443,14 @@ class PlayerAcceptanceTest(unittest.TestCase):
                 page.locator('[data-episode-id="101"]').click()
                 page.locator(".transcript-line").first.wait_for()
                 page.wait_for_function("document.querySelector('#audio').readyState >= 1")
+
+                # Hiding the page without a shadow session must not pause
+                # ordinary podcast playback.
+                page.evaluate("document.querySelector('#audio').play()")
+                page.wait_for_function("!document.querySelector('#audio').paused")
+                page.evaluate("window.dispatchEvent(new Event('pagehide'))")
+                self.assertFalse(page.locator("#audio").evaluate("el => el.paused"))
+                page.locator("#audio").evaluate("el => el.pause()")
 
                 # A permission prompt can resolve after the panel is closed;
                 # its late stream must be stopped without starting a recorder.
@@ -465,19 +480,30 @@ class PlayerAcceptanceTest(unittest.TestCase):
                 page.locator('[data-shadow-stop="0"]').click()
                 page.wait_for_function("window.__tracks.length === 2 && window.__tracks[1].stopped")
 
+                # Seeking to a word cancels an outstanding permission request;
+                # a subsequently granted stream is immediately released.
+                page.evaluate("window.__deferMic = true")
+                page.locator('[data-shadow-record="0"]').click()
+                page.wait_for_function("window.__micRequests.length === 3")
+                page.locator(".word").first.click()
+                page.evaluate("window.__deferMic = false; window.__micRequests[2].resolve()")
+                page.wait_for_function("window.__tracks.length === 3 && window.__tracks[2].stopped")
+                self.assertTrue(page.locator('[data-shadow-stop="0"]').is_hidden())
+                page.locator("#audio").evaluate("el => el.pause()")
+
                 # If starting the original fails after permission is granted,
                 # the owned recorder and microphone still need to be cleaned.
                 page.evaluate("window.__failNextOriginalPlay = true")
                 page.locator('[data-shadow-record="0"]').click()
                 page.get_by_text("Could not start recording. Try again.", exact=True).wait_for()
-                page.wait_for_function("window.__tracks.length === 3 && window.__tracks[2].stopped")
+                page.wait_for_function("window.__tracks.length === 4 && window.__tracks[3].stopped")
 
                 # Recorder construction can fail after microphone permission;
                 # that request must leave the UI retryable and stop its stream.
                 page.evaluate("window.__throwRecorder = true")
                 page.locator('[data-shadow-record="0"]').click()
                 page.get_by_text("Could not start recording. Try again.", exact=True).wait_for()
-                page.wait_for_function("window.__tracks.length === 4 && window.__tracks[3].stopped")
+                page.wait_for_function("window.__tracks.length === 5 && window.__tracks[4].stopped")
 
                 # Record at 1.5x, then change the player preference. Replay
                 # uses the capture rate and restores the user's selected rate.
@@ -496,6 +522,13 @@ class PlayerAcceptanceTest(unittest.TestCase):
                 for _ in range(20):
                     page.locator('[data-shadow-offset="-1"]').click()
                 self.assertEqual(page.locator(".shadow-offset-value").inner_text(), "−1.5 s")
+                # A short take ending before the negative-offset delay expires
+                # must remain ended; the source is the delayed track here.
+                page.locator('[data-shadow-mode="both"]').click()
+                page.locator("#shadow-take-audio").evaluate("el => el.dispatchEvent(new Event('ended'))")
+                page.wait_for_timeout(1600)
+                page.locator("#audio").evaluate("el => el.dispatchEvent(new Event('ended'))")
+                page.wait_for_function("document.querySelector('[data-shadow-mode=both]').getAttribute('aria-pressed') === 'false'")
                 for _ in range(15):
                     page.locator('[data-shadow-offset="1"]').click()
                 self.assertEqual(page.locator(".shadow-offset-value").inner_text(), "+0.0 s")
@@ -513,6 +546,14 @@ class PlayerAcceptanceTest(unittest.TestCase):
                 page.wait_for_timeout(200)
                 self.assertEqual(page.locator('[data-shadow-mode="both"]').get_attribute("aria-pressed"), "true")
                 self.assertAlmostEqual(page.locator("#shadow-take-audio").evaluate("el => el.playbackRate"), 1)
+                # Changing the source speed during a comparison stops the
+                # comparison so the original and take cannot drift apart.
+                page.locator("#speed-button").click()
+                page.locator('.speed-option[data-speed="2"]').click()
+                self.assertEqual(page.locator('[data-shadow-mode="both"]').get_attribute("aria-pressed"), "false")
+                self.assertAlmostEqual(page.locator("#audio").evaluate("el => el.playbackRate"), 2)
+                page.locator("#speed-button").click()
+                page.locator('.speed-option[data-speed="1.5"]').click()
                 page.locator("#play-button").click()
                 page.locator('[data-shadow-offset="-1"]').click()
                 page.locator("#speed-button").click()
@@ -528,8 +569,36 @@ class PlayerAcceptanceTest(unittest.TestCase):
                 page.locator('[data-shadow-record="0"]').click()
                 page.locator('[data-shadow-stop="0"]').wait_for(state="visible")
                 opener.click()
-                page.wait_for_function("window.__tracks.length === 6 && window.__tracks[5].stopped")
-                self.assertEqual(page.evaluate("window.__tracks.length"), 6)
+                page.wait_for_function("window.__tracks.length === 7 && window.__tracks[6].stopped")
+                self.assertEqual(page.evaluate("window.__tracks.length"), 7)
+
+                # A hanging source play must not leave the microphone without
+                # a bounded timer; stopping before its promise rejects keeps
+                # the take and ignores the late abort rejection.
+                opener.click()
+                page.locator("#toast").evaluate("el => { el.classList.remove('show'); el.textContent = ''; }")
+                page.evaluate("window.__deferOriginalPlay = true")
+                page.locator('[data-shadow-record="0"]').click()
+                page.locator('[data-shadow-stop="0"]').wait_for(state="visible")
+                page.wait_for_function("state.shadowRecording && state.shadowRecording.stopTimer !== null")
+                page.evaluate("state.shadowRecording.stopTimer && clearTimeout(state.shadowRecording.stopTimer)")
+                page.locator('[data-shadow-stop="0"]').click()
+                page.wait_for_function("state.shadowRecording === null")
+                page.evaluate("window.__playRequests[0].reject(new DOMException('Stopped before play resolved', 'AbortError')); window.__deferOriginalPlay = false")
+                page.wait_for_timeout(50)
+                self.assertTrue(page.locator('[data-shadow-mode="take"]').is_enabled())
+                self.assertNotEqual(page.locator("#toast").inner_text(), "Could not start recording. Try again.")
+
+                # A delayed but successful play start creates a bounded
+                # negative default offset for recorder startup silence.
+                page.evaluate("window.__delayOriginalPlayMs = 300")
+                page.locator('[data-shadow-record="0"]').click()
+                page.locator('[data-shadow-stop="0"]').wait_for(state="visible")
+                page.wait_for_timeout(350)
+                page.locator('[data-shadow-stop="0"]').click()
+                page.wait_for_function("!document.querySelector('[data-shadow-mode=take]').disabled")
+                offset = page.locator(".shadow-offset-value").inner_text()
+                self.assertIn(offset, ("−0.2 s", "−0.3 s", "−0.4 s"), f"measured startup offset was {offset}")
             finally:
                 browser.close()
 
